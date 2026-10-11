@@ -19,7 +19,6 @@ HOP_BY_HOP = {
 }
 
 MAX_BODY = 32 * 1024 * 1024
-
 HEARTBEAT_INTERVAL = 20.0
 HEARTBEAT_TIMEOUT = 60.0
 
@@ -52,7 +51,7 @@ async def _send(ws: web.WebSocketResponse, payload: dict) -> None:
         pass
 
 
-async def _broadcast_uis(payload: dict) -> None:
+async def broadcast_uis(payload: dict) -> None:
     if not uis:
         return
     data = json.dumps(payload)
@@ -60,7 +59,7 @@ async def _broadcast_uis(payload: dict) -> None:
 
 
 async def push_status() -> None:
-    await _broadcast_uis({"type": "status", "agent": "connected" if agent_ws else "disconnected"})
+    await broadcast_uis({"type": "status", "agent": "connected" if agent_ws else "disconnected"})
 
 
 async def _agent_watchdog(ws: web.WebSocketResponse) -> None:
@@ -259,7 +258,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     peer = request.remote
     log.info("%s connected from %s", role, peer)
 
-    # -------- client --------
+    # ---------------- client ----------------
     if role == "client":
         old = agent_ws
         agent_ws = ws
@@ -293,7 +292,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 if t == "hello":
                     agent_hello.clear()
                     agent_hello.update(m)
-                    await _broadcast_uis({"type": "hello", "host": m.get("host")})
+                    await broadcast_uis({"type": "hello", "host": m.get("host")})
                     continue
 
                 if t.startswith("tunnel_"):
@@ -321,9 +320,8 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         await tunnel.body_queue.put(None)
                     continue
 
-                # Everything else (output, exit, fs_*_result) is broadcast to all UIs.
-                # The sid field rides along; UIs filter by it.
-                await _broadcast_uis(m)
+                # output / exit / fs_*_result — broadcast to all UIs; they filter by sid
+                await broadcast_uis(m)
         finally:
             wd.cancel()
             try:
@@ -337,7 +335,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 await push_status()
         return ws
 
-    # -------- ui --------
+    # ---------------- ui ----------------
     uis.add(ws)
     try:
         await _send(ws, {"type": "status", "agent": "connected" if agent_ws else "disconnected"})
@@ -369,7 +367,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         await _send(ws, {"type": rt, "sid": sid, "id": m.get("id"), "error": "client offline"})
                 continue
 
-            # Relay verbatim to the single agent. sid is already in the payload.
+            # Relay verbatim to the single agent. sid rides along in the payload.
             await _send(agent_ws, m)
     finally:
         uis.discard(ws)
@@ -387,14 +385,12 @@ def main() -> None:
     app.router.add_get("/", handle_index)
     app.router.add_get("/ws", handle_ws)
     app.router.add_get("/healthz", lambda _: web.json_response({
-        "ok": True,
-        "agent": agent_ws is not None,
-        "uis": len(uis),
+        "ok": True, "agent": agent_ws is not None, "uis": len(uis),
     }))
     app.router.add_get("/t/{port}", handle_tunnel_root)
     app.router.add_route("*", "/t/{port}/{path:.*}", handle_tunnel)
-    log.info("host listening on http://0.0.0.0:8080")
-    web.run_app(app, host="0.0.0.0", port=8080, print=None)
+    log.info("host listening on http://0.0.0.0:8081")
+    web.run_app(app, host="0.0.0.0", port=8081, print=None)
 
 
 if __name__ == "__main__":

@@ -26,13 +26,9 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_HOST_FILE = HERE / "host.txt"
 HOST_FILE: Path = DEFAULT_HOST_FILE
 
-RETRY_MIN = 1.0
-RETRY_MAX = 15.0
-MAX_TRANSFER = 32 * 1024 * 1024
-
+RETRY_DELAY = 1.0
 HEARTBEAT_INTERVAL = 20.0
-
-_delay = RETRY_MIN
+MAX_TRANSFER = 32 * 1024 * 1024
 
 
 def log(msg: str) -> None:
@@ -42,14 +38,8 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------- config
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        prog="client.py",
-        description="WS relay client — reads the host URL from a text file and reconnects on failure.",
-    )
-    p.add_argument(
-        "host_file", nargs="?", default=str(DEFAULT_HOST_FILE),
-        help=f"path to the file containing the host URL (default: {DEFAULT_HOST_FILE})",
-    )
+    p = argparse.ArgumentParser(prog="client.py")
+    p.add_argument("host_file", nargs="?", default=str(DEFAULT_HOST_FILE))
     return p.parse_args()
 
 
@@ -62,7 +52,6 @@ def read_host_url() -> str | None:
     except OSError as e:
         log(f"cannot read {HOST_FILE.name}: {e}")
         return None
-
     for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
@@ -87,9 +76,9 @@ def to_ws_url(base: str) -> str:
 if not IS_WINDOWS:
     class _PipeEndpoint:
         __slots__ = ("_fd",)
-        def __init__(self, fd: int): self._fd = fd
-        def fileno(self) -> int: return self._fd
-        def close(self) -> None:
+        def __init__(self, fd): self._fd = fd
+        def fileno(self): return self._fd
+        def close(self):
             try: os.close(self._fd)
             except OSError: pass
 
@@ -97,37 +86,36 @@ if not IS_WINDOWS:
 # ---------------------------------------------------------------- shell
 
 class PersistentShell:
-    """Persistent shell with a real pty on POSIX so Ctrl+C works."""
+    """One bash per session (sid), persistent, with pty so Ctrl+C works."""
 
-    def __init__(self, ws, send_lock: asyncio.Lock, sid: str):
+    def __init__(self, ws, send_lock, sid):
         self.ws = ws
         self.send_lock = send_lock
         self.sid = sid
         self.proc = None
-        self.master_fd: int | None = None
-        self.reader: asyncio.StreamReader | None = None
-        self.pump_task: asyncio.Task | None = None
-        self.stderr_task: asyncio.Task | None = None
+        self.master_fd = None
+        self.reader = None
+        self.pump_task = None
+        self.stderr_task = None
         self.lock = asyncio.Lock()
-        self.current: dict | None = None
+        self.current = None
 
-    async def _send(self, payload: dict) -> None:
-        p = dict(payload)
-        p["sid"] = self.sid
+    async def _send(self, payload):
+        p = dict(payload); p["sid"] = self.sid
         async with self.send_lock:
             try:
                 await self.ws.send(json.dumps(p))
             except Exception:
                 pass
 
-    def _proc_dead(self) -> bool:
+    def _proc_dead(self):
         if self.proc is None:
             return True
         if IS_WINDOWS:
             return self.proc.returncode is not None
         return self.proc.poll() is not None
 
-    async def start(self) -> None:
+    async def start(self):
         if IS_WINDOWS:
             await self._start_windows()
         else:
@@ -135,7 +123,7 @@ class PersistentShell:
         self.pump_task = asyncio.create_task(self._pump())
         await self._prime()
 
-    async def _start_windows(self) -> None:
+    async def _start_windows(self):
         self.proc = await asyncio.create_subprocess_exec(
             "cmd.exe", "/Q", "/V:ON",
             stdin=asyncio.subprocess.PIPE,
@@ -144,13 +132,12 @@ class PersistentShell:
         )
         self.reader = self.proc.stdout
 
-    async def _start_posix(self) -> None:
+    async def _start_posix(self):
         master, slave = pty.openpty()
-
         try:
             attrs = termios.tcgetattr(slave)
-            attrs[3] &= ~(termios.ECHO | termios.ECHONL)   # lflag: no echo
-            attrs[1] &= ~termios.ONLCR                     # oflag: no \n → \r\n
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL)
+            attrs[1] &= ~termios.ONLCR
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         except Exception as e:
@@ -162,7 +149,7 @@ class PersistentShell:
         env["PS2"] = ""
         env["PROMPT_COMMAND"] = ""
 
-        def _child_setup() -> None:
+        def _child_setup():
             os.setsid()
             try:
                 fcntl.ioctl(0, termios.TIOCSCTTY, 0)
@@ -175,7 +162,6 @@ class PersistentShell:
             env=env, preexec_fn=_child_setup, close_fds=True,
         )
         os.close(slave)
-
         self.master_fd = os.dup(master)
 
         loop = asyncio.get_event_loop()
@@ -184,7 +170,7 @@ class PersistentShell:
         await loop.connect_read_pipe(lambda: protocol, _PipeEndpoint(master))
         self.reader = reader
 
-    async def _prime(self) -> None:
+    async def _prime(self):
         marker = f"__RELAY_PRIME_{uuid.uuid4().hex}__"
         payload = f"echo {marker}\r\n" if IS_WINDOWS else f"printf '{marker}\\n'\n"
         event = asyncio.Event()
@@ -192,7 +178,7 @@ class PersistentShell:
         await self._write(payload.encode())
         await event.wait()
 
-    async def _write(self, data: bytes) -> None:
+    async def _write(self, data):
         if IS_WINDOWS:
             if not (self.proc and self.proc.stdin):
                 raise BrokenPipeError("no stdin")
@@ -211,7 +197,7 @@ class PersistentShell:
             except InterruptedError:
                 continue
 
-    async def _emit(self, data: str, stream: str = "stdout") -> None:
+    async def _emit(self, data, stream="stdout"):
         cur = self.current
         if cur is None:
             return
@@ -222,7 +208,7 @@ class PersistentShell:
                 "type": "output", "id": cur["id"], "stream": stream, "data": data,
             })
 
-    async def _stderr_pump(self) -> None:
+    async def _stderr_pump(self):
         if not (self.proc and getattr(self.proc, "stderr", None)):
             return
         while True:
@@ -235,7 +221,7 @@ class PersistentShell:
             if self.current:
                 await self._emit(chunk.decode("utf-8", errors="replace"), "stderr")
 
-    async def _pump(self) -> None:
+    async def _pump(self):
         if IS_WINDOWS:
             self.stderr_task = asyncio.create_task(self._stderr_pump())
         assert self.reader is not None
@@ -249,7 +235,6 @@ class PersistentShell:
                 if not chunk:
                     break
                 buf += chunk.decode("utf-8", errors="replace")
-
                 if self.current is None:
                     buf = ""
                     continue
@@ -264,22 +249,18 @@ class PersistentShell:
                             if out:
                                 await self._emit(out)
                         break
-
                     out = buf[:idx]
                     if out:
                         await self._emit(out)
-
                     rest = buf[idx + len(marker):]
                     nl = rest.find("\n")
                     if nl == -1:
                         break
-
                     code_str = rest[:nl].strip()
                     try:
                         code = int(code_str)
                     except ValueError:
                         code = -1
-
                     cur = self.current
                     self.current = None
                     cur["code"] = code
@@ -295,7 +276,6 @@ class PersistentShell:
                 except (asyncio.CancelledError, Exception):
                     pass
                 self.stderr_task = None
-
             cur = self.current
             if cur is not None and not cur["event"].is_set():
                 cur["event"].set()
@@ -305,13 +285,13 @@ class PersistentShell:
                     except Exception:
                         pass
 
-    def _build_payload(self, cmd: str, marker: str) -> str:
+    def _build_payload(self, cmd, marker):
         if IS_WINDOWS:
             oneline = cmd.replace("\r\n", "\n").replace("\n", " & ")
             return f"{oneline} & echo {marker}!errorlevel!\r\n"
         return f"{cmd}\nprintf '\\n{marker}%d\\n' $?\n"
 
-    async def run(self, cmd_id: str, cmd: str) -> None:
+    async def run(self, cmd_id, cmd):
         async with self.lock:
             if self._proc_dead():
                 await self.start()
@@ -331,7 +311,7 @@ class PersistentShell:
                 return
             await event.wait()
 
-    async def capture(self, cmd: str) -> tuple[str, int]:
+    async def capture(self, cmd):
         async with self.lock:
             if self._proc_dead():
                 await self.start()
@@ -348,12 +328,12 @@ class PersistentShell:
             await event.wait()
             return "".join(buf), cur_ref.get("code", -1)
 
-    async def get_cwd(self) -> str:
+    async def get_cwd(self):
         out, _ = await self.capture("cd" if IS_WINDOWS else "pwd")
         lines = [ln for ln in out.splitlines() if ln.strip()]
         return lines[-1].strip() if lines else os.getcwd()
 
-    async def interrupt(self, cmd_id: str) -> None:
+    async def interrupt(self, cmd_id):
         cur = self.current
         if cur is None:
             return
@@ -373,39 +353,27 @@ class PersistentShell:
         except OSError:
             pass
 
-    async def stop(self) -> None:
+    async def stop(self):
         if self.proc is not None:
             if IS_WINDOWS:
                 if self.proc.returncode is None:
-                    try:
-                        self.proc.terminate()
-                    except Exception:
-                        pass
-                    try:
-                        await asyncio.wait_for(self.proc.wait(), timeout=3)
+                    try: self.proc.terminate()
+                    except Exception: pass
+                    try: await asyncio.wait_for(self.proc.wait(), timeout=3)
                     except asyncio.TimeoutError:
-                        try:
-                            self.proc.kill()
-                        except Exception:
-                            pass
+                        try: self.proc.kill()
+                        except Exception: pass
             else:
                 if self.proc.poll() is None:
-                    try:
-                        self.proc.terminate()
-                    except Exception:
-                        pass
-                    try:
-                        self.proc.wait(timeout=3)
+                    try: self.proc.terminate()
+                    except Exception: pass
+                    try: self.proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        try:
-                            self.proc.kill()
-                        except Exception:
-                            pass
+                        try: self.proc.kill()
+                        except Exception: pass
         if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
+            try: os.close(self.master_fd)
+            except OSError: pass
             self.master_fd = None
         if self.pump_task:
             self.pump_task.cancel()
@@ -418,7 +386,7 @@ class PersistentShell:
 
 # ---------------------------------------------------------------- helpers
 
-async def _send_msg(ws, send_lock: asyncio.Lock, payload: dict, sid: str | None = None) -> None:
+async def _send_msg(ws, send_lock, payload, sid=None):
     p = dict(payload)
     if sid:
         p["sid"] = sid
@@ -429,8 +397,7 @@ async def _send_msg(ws, send_lock: asyncio.Lock, payload: dict, sid: str | None 
             pass
 
 
-async def _heartbeat_loop(ws, send_lock: asyncio.Lock) -> None:
-    """Send an application-level ping every HEARTBEAT_INTERVAL seconds."""
+async def _heartbeat_loop(ws, send_lock):
     try:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -534,7 +501,7 @@ HOP_BY_HOP_LOCAL = {
 }
 
 
-async def handle_tunnel_open(ws, send_lock, m, active_tunnels: dict):
+async def handle_tunnel_open(ws, send_lock, m, active_tunnels):
     kind = m.get("kind")
     if kind == "http":
         await _do_http_tunnel(ws, send_lock, m)
@@ -581,7 +548,7 @@ async def _do_http_tunnel(ws, send_lock, m):
         })
 
 
-async def _do_ws_tunnel(ws, send_lock, m, active_tunnels: dict):
+async def _do_ws_tunnel(ws, send_lock, m, active_tunnels):
     tid = m["id"]
     port = m["port"]
     path = m.get("path") or "/"
@@ -603,7 +570,7 @@ async def _do_ws_tunnel(ws, send_lock, m, active_tunnels: dict):
         ) as upstream:
             await _send_msg(ws, send_lock, {"type": "tunnel_ready", "id": tid})
 
-            async def b2u() -> None:
+            async def b2u():
                 while True:
                     msg = await q.get()
                     mt = msg.get("type")
@@ -618,7 +585,7 @@ async def _do_ws_tunnel(ws, send_lock, m, active_tunnels: dict):
                         except websockets.ConnectionClosed:
                             return
 
-            async def u2b() -> None:
+            async def u2b():
                 try:
                     async for msg in upstream:
                         if isinstance(msg, str):
@@ -649,8 +616,6 @@ async def _do_ws_tunnel(ws, send_lock, m, active_tunnels: dict):
 # ---------------------------------------------------------------- session
 
 async def session(url: str) -> None:
-    global _delay
-
     async with websockets.connect(
         url,
         ping_interval=None,
@@ -658,7 +623,6 @@ async def session(url: str) -> None:
         max_size=None,
         additional_headers={"ngrok-skip-browser-warning": "true"},
     ) as ws:
-        _delay = RETRY_MIN
         log(f"connected to {url}")
 
         send_lock = asyncio.Lock()
@@ -666,7 +630,7 @@ async def session(url: str) -> None:
             await ws.send(json.dumps({
                 "type": "hello",
                 "host": socket.gethostname(),
-                "shell": "cmd" if IS_WINDOWS else "bash",
+                "cwd": os.getcwd(),
             }))
 
         hb = asyncio.create_task(_heartbeat_loop(ws, send_lock))
@@ -674,7 +638,7 @@ async def session(url: str) -> None:
         shells: dict[str, PersistentShell] = {}
         active_tunnels: dict[str, asyncio.Queue] = {}
 
-        async def get_shell(sid: str) -> PersistentShell:
+        async def get_shell(sid):
             shell = shells.get(sid)
             if shell is None:
                 shell = PersistentShell(ws, send_lock, sid)
@@ -740,8 +704,7 @@ async def session(url: str) -> None:
 # ---------------------------------------------------------------- main
 
 async def main() -> None:
-    global _delay, HOST_FILE
-
+    global HOST_FILE
     args = parse_args()
     HOST_FILE = Path(args.host_file).expanduser().resolve()
 
@@ -751,9 +714,7 @@ async def main() -> None:
     while True:
         url = read_host_url()
         if url is None:
-            log(f"retrying config read in {_delay:.1f}s")
-            await asyncio.sleep(_delay)
-            _delay = min(_delay * 2, RETRY_MAX)
+            await asyncio.sleep(RETRY_DELAY)
             continue
 
         ws_url = to_ws_url(url)
@@ -767,9 +728,8 @@ async def main() -> None:
         except Exception as e:
             log(f"{type(e).__name__}: {e}")
 
-        log(f"reconnecting in {_delay:.1f}s")
-        await asyncio.sleep(_delay)
-        _delay = min(_delay * 2, RETRY_MAX)
+        log(f"reconnecting in {RETRY_DELAY:.1f}s")
+        await asyncio.sleep(RETRY_DELAY)
 
 
 if __name__ == "__main__":

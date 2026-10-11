@@ -34,7 +34,8 @@
     </div>
 
     <div class="ml-auto flex items-center gap-2">
-      <span class="text-[10px] text-neutral-600 font-mono" :title="sid" x-text="'sid ' + (sid ? sid.slice(0,8) : '…')"></span>
+      <span class="text-[10px] text-neutral-600 font-mono" :title="sid"
+            x-text="'sid ' + (sid ? sid.slice(0,8) : '…')"></span>
       <button @click="openPort()"
               class="rounded-md border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">
         open port
@@ -240,7 +241,7 @@ function consoleApp() {
     },
 
     handle(m) {
-      // Ignore anything tagged for a different session.
+      // Drop anything tagged for a different tab.
       if (m.sid && m.sid !== this.sid) return;
 
       for (const h of this.rpcWaiters.slice()) {
@@ -319,7 +320,10 @@ function consoleApp() {
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-      this.blocks.push({ uid: ++this.uid, kind: 'cmd', id, cmd, out: '', err: '', exit: null, done: false, running: true });
+      this.blocks.push({
+        uid: ++this.uid, kind: 'cmd', id, cmd,
+        out: '', err: '', exit: null, done: false, running: true,
+      });
       this.ws.send(JSON.stringify({ type: 'command', id, sid: this.sid, cmd }));
 
       if (this.history[this.history.length - 1] !== cmd) this.history.push(cmd);
@@ -364,6 +368,7 @@ function consoleApp() {
       });
     },
 
+    // ---------- file panel ----------
     togglePanel() {
       this.panel.open = !this.panel.open;
       if (this.panel.open) this.reloadToCwd();
@@ -482,7 +487,9 @@ function consoleApp() {
         try {
           const buf = await f.arrayBuffer();
           const b64 = this.bufToB64(buf);
-          const sep = (dir.endsWith('/') || dir.endsWith('\\')) ? '' : (navigator.userAgent.includes('Win') ? '\\' : '/');
+          const sep = (dir.endsWith('/') || dir.endsWith('\\'))
+            ? ''
+            : (navigator.userAgent.includes('Win') ? '\\' : '/');
           const path = dir + sep + f.name;
           this.sys(`uploading ${f.name} (${this.fmtSize(f.size)}) → ${path}…`);
           const res = await this.rpc('fs_put', { path, data: b64 }, 120000);
