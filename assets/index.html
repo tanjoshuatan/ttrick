@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WS Command Console</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+<style>
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 9999px; }
+  ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+</style>
+</head>
+<body class="h-full bg-neutral-950 text-neutral-200 antialiased">
+<div x-data="consoleApp()" class="flex h-full flex-col">
+
+  <header class="flex items-center gap-5 border-b border-neutral-800 bg-neutral-900/60 px-4 py-2.5">
+    <div class="flex items-center gap-2">
+      <span class="h-2.5 w-2.5 rounded-full" :class="uiConnected ? 'bg-emerald-400' : 'bg-red-500'"></span>
+      <span class="text-sm font-medium">host</span>
+      <span class="text-xs text-neutral-500" x-text="uiConnected ? 'connected' : 'reconnecting…'"></span>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="h-2.5 w-2.5 rounded-full" :class="agentOnline ? 'bg-emerald-400' : 'bg-neutral-600'"></span>
+      <span class="text-sm font-medium">client</span>
+      <span class="text-xs text-neutral-500" x-text="agentOnline ? (agentInfo || 'online') : 'offline'"></span>
+    </div>
+    <button @click="clear()"
+            class="ml-auto rounded-md border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">
+      clear
+    </button>
+  </header>
+
+  <main x-ref="out" class="flex-1 overflow-y-auto px-4 py-3 font-mono text-[13px] leading-relaxed">
+    <template x-for="b in blocks" :key="b.uid">
+      <div class="mb-3">
+        <template x-if="b.kind === 'sys'">
+          <div class="text-xs italic text-neutral-500" x-text="b.text"></div>
+        </template>
+        <template x-if="b.kind === 'cmd'">
+          <div>
+            <div class="flex gap-2">
+              <span class="select-none text-emerald-400">$</span>
+              <span class="whitespace-pre-wrap break-all text-neutral-100" x-text="b.cmd"></span>
+            </div>
+            <pre x-show="b.out" class="whitespace-pre-wrap break-all text-neutral-300" x-text="b.out"></pre>
+            <pre x-show="b.err" class="whitespace-pre-wrap break-all text-red-400" x-text="b.err"></pre>
+            <div x-show="b.done && b.exit !== 0" class="mt-0.5 text-xs text-amber-500"
+                 x-text="'↳ exit ' + b.exit"></div>
+          </div>
+        </template>
+      </div>
+    </template>
+    <div x-show="blocks.length === 0" class="text-neutral-600">type a command below…</div>
+  </main>
+
+  <footer class="border-t border-neutral-800 bg-neutral-900/60 px-4 py-3">
+    <div class="flex items-start gap-2 font-mono text-[13px]">
+      <span class="select-none pt-1.5 text-emerald-400">$</span>
+      <textarea x-ref="input" x-model="input" spellcheck="false" autocomplete="off"
+                placeholder="ls -la   (Shift+Enter for newline)"
+                rows="1"
+                @keydown.enter="onEnter($event)"
+                @keydown.up.prevent="hist(-1)"
+                @keydown.down.prevent="hist(1)"
+                :disabled="!uiConnected"
+                class="flex-1 resize-none bg-transparent text-neutral-100 placeholder-neutral-600 outline-none disabled:opacity-40 leading-relaxed"
+                style="max-height: 40vh; overflow-y: auto;"></textarea>
+      <button @click="send()" :disabled="!uiConnected"
+              class="mt-0.5 rounded-md bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40">
+        run
+      </button>
+    </div>
+  </footer>
+</div>
+
+<script>
+function consoleApp() {
+  return {
+    ws: null,
+    uiConnected: false,
+    agentOnline: false,
+    agentInfo: '',
+    blocks: [],
+    input: '',
+    history: [],
+    histIdx: 0,
+    uid: 0,
+    reconnectDelay: 500,
+
+    init() {
+      this.connect();
+      this.$nextTick(() => {
+        this.focus();
+        this.autosize();
+      });
+      this.$watch('input', () => this.autosize());
+    },
+
+    focus() {
+      if (this.$refs.input) this.$refs.input.focus();
+    },
+
+    autosize() {
+      this.$nextTick(() => {
+        const el = this.$refs.input;
+        if (!el) return;
+        el.style.height = 'auto';
+        el.style.height = Math.min(el.scrollHeight, window.innerHeight * 0.4) + 'px';
+      });
+    },
+
+    onEnter(e) {
+      if (e.shiftKey) return;          // Shift+Enter -> default (insert newline)
+      e.preventDefault();
+      this.send();
+    },
+
+    connect() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${location.host}/ws?role=ui`);
+      this.ws = ws;
+
+      ws.onopen = () => {
+        this.uiConnected = true;
+        this.reconnectDelay = 500;
+        this.sys('connected to host');
+      };
+
+      ws.onmessage = (ev) => {
+        let m;
+        try { m = JSON.parse(ev.data); } catch { return; }
+        this.handle(m);
+      };
+
+      ws.onclose = () => {
+        this.uiConnected = false;
+        this.agentOnline = false;
+        this.agentInfo = '';
+        this.sys('host connection lost — retrying…');
+        setTimeout(() => this.connect(), this.reconnectDelay);
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, 8000);
+      };
+
+      ws.onerror = () => {};
+    },
+
+    handle(m) {
+      switch (m.type) {
+        case 'status':
+          this.agentOnline = m.agent === 'connected';
+          if (!this.agentOnline) this.agentInfo = '';
+          this.sys(`client ${this.agentOnline ? 'connected' : 'disconnected'}`);
+          break;
+        case 'hello':
+          this.agentInfo = [m.host, m.cwd].filter(Boolean).join(' · ');
+          break;
+        case 'output': {
+          const b = this.blocks.find(x => x.id === m.id);
+          if (!b) break;
+          if (m.stream === 'stderr') b.err += m.data; else b.out += m.data;
+          this.scrollDown();
+          break;
+        }
+        case 'exit': {
+          const b = this.blocks.find(x => x.id === m.id);
+          if (!b) break;
+          b.exit = m.code;
+          b.done = true;
+          this.scrollDown();
+          break;
+        }
+      }
+    },
+
+    send() {
+      const cmd = this.input.replace(/\s+$/, '');   // trim trailing whitespace/newlines
+      if (!cmd) return;
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        this.sys('not connected to host');
+        return;
+      }
+      if (!this.agentOnline) {
+        this.sys('client offline — command not sent');
+        return;
+      }
+
+      const id = crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+      this.blocks.push({ uid: ++this.uid, kind: 'cmd', id, cmd, out: '', err: '', exit: null, done: false });
+      this.ws.send(JSON.stringify({ type: 'command', id, cmd }));
+
+      if (this.history[this.history.length - 1] !== cmd) this.history.push(cmd);
+      this.histIdx = this.history.length;
+      this.input = '';
+      this.autosize();
+      this.scrollDown();
+    },
+
+    hist(dir) {
+      if (!this.history.length) return;
+      this.histIdx = Math.max(0, Math.min(this.history.length, this.histIdx + dir));
+      this.input = this.histIdx >= this.history.length ? '' : this.history[this.histIdx];
+    },
+
+    sys(text) {
+      this.blocks.push({ uid: ++this.uid, kind: 'sys', text });
+      this.scrollDown();
+    },
+
+    clear() { this.blocks = []; },
+
+    scrollDown() {
+      this.$nextTick(() => {
+        const el = this.$refs.out;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    },
+  };
+}
+</script>
+</body>
+</html>
