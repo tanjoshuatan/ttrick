@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import base64
 import json
@@ -9,14 +10,18 @@ import socket
 import uuid
 from pathlib import Path
 
+import aiohttp
 import websockets
 
 HERE = Path(__file__).resolve().parent
-HOST_FILE = HERE / "host.txt"
+DEFAULT_HOST_FILE = HERE / "host.txt"
+
+# Populated by parse_args() in main(). read_host_url() uses the global.
+HOST_FILE: Path = DEFAULT_HOST_FILE
 
 RETRY_MIN = 1.0
 RETRY_MAX = 15.0
-MAX_TRANSFER = 32 * 1024 * 1024  # 32 MB cap per file transfer
+MAX_TRANSFER = 32 * 1024 * 1024
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -28,6 +33,20 @@ def log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------- config
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="client.py",
+        description="WS relay client — reads the host URL from a text file and reconnects on failure.",
+    )
+    p.add_argument(
+        "host_file",
+        nargs="?",
+        default=str(DEFAULT_HOST_FILE),
+        help=f"path to the file containing the host URL (default: {DEFAULT_HOST_FILE})",
+    )
+    return p.parse_args()
+
 
 def read_host_url() -> str | None:
     try:
@@ -58,11 +77,9 @@ def to_ws_url(base: str) -> str:
     return f"{base}/ws?role=client"
 
 
-# ---------------------------------------------------------------- persistent shell
+# ---------------------------------------------------------------- shell
 
 class PersistentShell:
-    """One shell process per WS session. Commands run serially, so state persists."""
-
     def __init__(self, ws, send_lock: asyncio.Lock):
         self.ws = ws
         self.send_lock = send_lock
@@ -115,10 +132,7 @@ class PersistentShell:
             cur["capture"].append(data)
         else:
             await self._send({
-                "type": "output",
-                "id": cur["id"],
-                "stream": stream,
-                "data": data,
+                "type": "output", "id": cur["id"], "stream": stream, "data": data,
             })
 
     async def _pump(self) -> None:
@@ -190,6 +204,12 @@ class PersistentShell:
             except (asyncio.CancelledError, Exception):
                 pass
 
+    def _build_payload(self, cmd: str, marker: str) -> str:
+        if IS_WINDOWS:
+            oneline = cmd.replace("\r\n", "\n").replace("\n", " & ")
+            return f"{oneline} & echo {marker}!errorlevel!\r\n"
+        return f"{cmd}\nprintf '\\n{marker}%d\\n' $?\n"
+
     async def run(self, cmd_id: str, cmd: str) -> None:
         async with self.lock:
             if self.proc is None or self.proc.returncode is not None:
@@ -199,15 +219,9 @@ class PersistentShell:
             event = asyncio.Event()
             self.current = {"id": cmd_id, "marker": marker, "event": event}
 
-            if IS_WINDOWS:
-                oneline = cmd.replace("\r\n", "\n").replace("\n", " & ")
-                payload = f"{oneline} & echo {marker}!errorlevel!\r\n"
-            else:
-                payload = f"{cmd}\nprintf '\\n{marker}%d\\n' $?\n"
-
             try:
                 assert self.proc and self.proc.stdin
-                self.proc.stdin.write(payload.encode("utf-8"))
+                self.proc.stdin.write(self._build_payload(cmd, marker).encode("utf-8"))
                 await self.proc.stdin.drain()
             except (BrokenPipeError, ConnectionResetError):
                 await self._send({
@@ -222,7 +236,6 @@ class PersistentShell:
             await event.wait()
 
     async def capture(self, cmd: str) -> tuple[str, int]:
-        """Run a command silently and return (stdout+stderr, exit code)."""
         async with self.lock:
             if self.proc is None or self.proc.returncode is not None:
                 await self.start()
@@ -233,15 +246,9 @@ class PersistentShell:
             cur_ref: dict = {"id": "__capture__", "marker": marker, "event": event, "capture": buf}
             self.current = cur_ref
 
-            if IS_WINDOWS:
-                oneline = cmd.replace("\r\n", "\n").replace("\n", " & ")
-                payload = f"{oneline} & echo {marker}!errorlevel!\r\n"
-            else:
-                payload = f"{cmd}\nprintf '\\n{marker}%d\\n' $?\n"
-
             try:
                 assert self.proc and self.proc.stdin
-                self.proc.stdin.write(payload.encode("utf-8"))
+                self.proc.stdin.write(self._build_payload(cmd, marker).encode("utf-8"))
                 await self.proc.stdin.drain()
             except Exception:
                 self.current = None
@@ -251,10 +258,7 @@ class PersistentShell:
             return "".join(buf), cur_ref.get("code", -1)
 
     async def get_cwd(self) -> str:
-        if IS_WINDOWS:
-            out, _ = await self.capture("cd")
-        else:
-            out, _ = await self.capture("pwd")
+        out, _ = await self.capture("cd" if IS_WINDOWS else "pwd")
         lines = [ln for ln in out.splitlines() if ln.strip()]
         return lines[-1].strip() if lines else os.getcwd()
 
@@ -279,7 +283,7 @@ class PersistentShell:
                 pass
 
 
-# ---------------------------------------------------------------- fs handlers
+# ---------------------------------------------------------------- helpers
 
 async def _send_msg(ws, send_lock: asyncio.Lock, payload: dict) -> None:
     async with send_lock:
@@ -289,7 +293,9 @@ async def _send_msg(ws, send_lock: asyncio.Lock, payload: dict) -> None:
             pass
 
 
-async def handle_fs_cwd(shell: PersistentShell, ws, send_lock, m: dict) -> None:
+# ---------------------------------------------------------------- fs handlers
+
+async def handle_fs_cwd(shell, ws, send_lock, m):
     try:
         cwd = await shell.get_cwd()
         await _send_msg(ws, send_lock, {"type": "fs_cwd_result", "id": m["id"], "cwd": cwd})
@@ -297,7 +303,7 @@ async def handle_fs_cwd(shell: PersistentShell, ws, send_lock, m: dict) -> None:
         await _send_msg(ws, send_lock, {"type": "fs_cwd_result", "id": m["id"], "error": str(e)})
 
 
-async def handle_fs_list(ws, send_lock, m: dict) -> None:
+async def handle_fs_list(ws, send_lock, m):
     path = m.get("path", "/")
     try:
         entries = []
@@ -324,7 +330,7 @@ async def handle_fs_list(ws, send_lock, m: dict) -> None:
         })
 
 
-async def handle_fs_get(ws, send_lock, m: dict) -> None:
+async def handle_fs_get(ws, send_lock, m):
     path = m.get("path", "")
     try:
         st = os.stat(path)
@@ -342,7 +348,7 @@ async def handle_fs_get(ws, send_lock, m: dict) -> None:
         })
 
 
-async def handle_fs_put(ws, send_lock, m: dict) -> None:
+async def handle_fs_put(ws, send_lock, m):
     path = m.get("path", "")
     try:
         data = base64.b64decode(m.get("data", ""))
@@ -360,6 +366,145 @@ async def handle_fs_put(ws, send_lock, m: dict) -> None:
         await _send_msg(ws, send_lock, {
             "type": "fs_put_result", "id": m["id"], "path": path, "ok": False, "error": str(e),
         })
+
+
+# ---------------------------------------------------------------- tunnel handlers
+
+DROP_FOR_UPSTREAM = {"host", "content-length"}
+DROP_FOR_WS_UPSTREAM = {
+    "host", "connection", "upgrade",
+    "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
+}
+
+HOP_BY_HOP_LOCAL = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade",
+}
+
+
+async def handle_tunnel_open(ws, send_lock, m, active_tunnels: dict):
+    kind = m.get("kind")
+    if kind == "http":
+        await _do_http_tunnel(ws, send_lock, m)
+    elif kind == "ws":
+        await _do_ws_tunnel(ws, send_lock, m, active_tunnels)
+
+
+async def _do_http_tunnel(ws, send_lock, m):
+    tid = m["id"]
+    port = m["port"]
+    path = m.get("path") or "/"
+    query = m.get("query", "")
+
+    url = f"http://127.0.0.1:{port}{path}"
+    if query:
+        url += "?" + query
+
+    headers = {
+        k: v for k, v in (m.get("headers") or {}).items()
+        if k.lower() not in DROP_FOR_UPSTREAM
+    }
+    body = base64.b64decode(m["body_b64"]) if m.get("body_b64") else None
+
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.request(
+                m["method"], url, headers=headers, data=body,
+                allow_redirects=False, auto_decompress=False,
+            ) as resp:
+                resp_headers = {
+                    k: v for k, v in resp.headers.items()
+                    if k.lower() not in HOP_BY_HOP_LOCAL
+                }
+                await _send_msg(ws, send_lock, {
+                    "type": "tunnel_response",
+                    "id": tid,
+                    "status": resp.status,
+                    "headers": resp_headers,
+                })
+                async for chunk in resp.content.iter_chunked(16384):
+                    if not chunk:
+                        continue
+                    await _send_msg(ws, send_lock, {
+                        "type": "tunnel_data",
+                        "id": tid,
+                        "data_b64": base64.b64encode(chunk).decode(),
+                    })
+        await _send_msg(ws, send_lock, {"type": "tunnel_end", "id": tid})
+    except Exception as e:
+        await _send_msg(ws, send_lock, {
+            "type": "tunnel_error", "id": tid, "error": f"{type(e).__name__}: {e}",
+        })
+
+
+async def _do_ws_tunnel(ws, send_lock, m, active_tunnels: dict):
+    tid = m["id"]
+    port = m["port"]
+    path = m.get("path") or "/"
+    query = m.get("query", "")
+
+    url = f"ws://127.0.0.1:{port}{path}"
+    if query:
+        url += "?" + query
+
+    headers = {
+        k: v for k, v in (m.get("headers") or {}).items()
+        if k.lower() not in DROP_FOR_WS_UPSTREAM
+    }
+
+    q: asyncio.Queue = asyncio.Queue()
+    active_tunnels[tid] = q
+
+    try:
+        async with websockets.connect(
+            url, additional_headers=headers, max_size=None,
+            ping_interval=None, ping_timeout=None,
+        ) as upstream:
+            await _send_msg(ws, send_lock, {"type": "tunnel_ready", "id": tid})
+
+            async def b2u() -> None:
+                while True:
+                    msg = await q.get()
+                    mt = msg.get("type")
+                    if mt == "tunnel_close":
+                        return
+                    if mt == "tunnel_ws_data":
+                        try:
+                            if msg.get("is_text"):
+                                await upstream.send(msg.get("data", ""))
+                            else:
+                                await upstream.send(base64.b64decode(msg.get("data", "")))
+                        except websockets.ConnectionClosed:
+                            return
+
+            async def u2b() -> None:
+                try:
+                    async for msg in upstream:
+                        if isinstance(msg, str):
+                            await _send_msg(ws, send_lock, {
+                                "type": "tunnel_ws_data", "id": tid,
+                                "data": msg, "is_text": True,
+                            })
+                        else:
+                            await _send_msg(ws, send_lock, {
+                                "type": "tunnel_ws_data", "id": tid,
+                                "data": base64.b64encode(msg).decode(),
+                                "is_text": False,
+                            })
+                except websockets.ConnectionClosed:
+                    pass
+
+            try:
+                await asyncio.gather(b2u(), u2b())
+            except Exception:
+                pass
+    except Exception as e:
+        await _send_msg(ws, send_lock, {
+            "type": "tunnel_error", "id": tid, "error": f"{type(e).__name__}: {e}",
+        })
+    finally:
+        active_tunnels.pop(tid, None)
 
 
 # ---------------------------------------------------------------- session
@@ -383,6 +528,8 @@ async def session(url: str) -> None:
         shell = PersistentShell(ws, send_lock)
         await shell.start()
 
+        active_tunnels: dict[str, asyncio.Queue] = {}
+
         try:
             async for raw in ws:
                 try:
@@ -390,6 +537,7 @@ async def session(url: str) -> None:
                 except json.JSONDecodeError:
                     continue
                 t = m.get("type")
+
                 if t == "command":
                     log(f"exec: {m.get('cmd','')}")
                     asyncio.create_task(shell.run(m["id"], m.get("cmd") or ""))
@@ -401,14 +549,30 @@ async def session(url: str) -> None:
                     asyncio.create_task(handle_fs_get(ws, send_lock, m))
                 elif t == "fs_put":
                     asyncio.create_task(handle_fs_put(ws, send_lock, m))
+                elif t == "tunnel_open":
+                    log(f"tunnel: {m.get('kind')} :{m.get('port')}{m.get('path','')}")
+                    asyncio.create_task(handle_tunnel_open(ws, send_lock, m, active_tunnels))
+                elif t in ("tunnel_ws_data", "tunnel_close"):
+                    q = active_tunnels.get(m.get("id"))
+                    if q:
+                        await q.put(m)
         finally:
+            for q in active_tunnels.values():
+                await q.put({"type": "tunnel_close"})
             await shell.stop()
 
 
-# ---------------------------------------------------------------- main loop
+# ---------------------------------------------------------------- main
 
 async def main() -> None:
-    global _delay
+    global _delay, HOST_FILE
+
+    args = parse_args()
+    HOST_FILE = Path(args.host_file).expanduser().resolve()
+
+    if not HOST_FILE.exists():
+        log(f"warning: {HOST_FILE} does not exist yet — will keep retrying")
+
     while True:
         url = read_host_url()
         if url is None:

@@ -33,17 +33,21 @@
       <span class="text-xs text-neutral-500" x-text="agentOnline ? (agentInfo || 'online') : 'offline'"></span>
     </div>
 
-    <button @click="clear()"
-            class="ml-auto rounded-md border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">
-      clear
-    </button>
+    <div class="ml-auto flex items-center gap-2">
+      <button @click="openPort()"
+              class="rounded-md border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">
+        open port
+      </button>
+      <button @click="clear()"
+              class="rounded-md border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">
+        clear
+      </button>
+    </div>
   </header>
 
-  <!-- file panel backdrop -->
   <div x-show="panel.open" x-cloak @click="panel.open = false"
        class="fixed inset-0 z-30 bg-black/50"></div>
 
-  <!-- file panel -->
   <aside x-show="panel.open" x-cloak
          class="fixed left-0 top-0 bottom-0 z-40 flex w-80 max-w-[85vw] flex-col border-r border-neutral-800 bg-neutral-900 shadow-2xl sm:w-96">
     <div class="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">
@@ -164,7 +168,7 @@ function consoleApp() {
     uploadTarget: '',
     panel: {
       open: false,
-      root: null,   // { name, path, type:'dir', children, expanded, loading }
+      root: null,
     },
 
     init() {
@@ -221,7 +225,6 @@ function consoleApp() {
     },
 
     handle(m) {
-      // RPC responses first
       for (const h of this.rpcWaiters.slice()) {
         if (h(m)) {
           const i = this.rpcWaiters.indexOf(h);
@@ -258,7 +261,6 @@ function consoleApp() {
       }
     },
 
-    // ---------- rpc ----------
     rpc(type, payload = {}, timeoutMs = 15000) {
       return new Promise((resolve) => {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -287,7 +289,6 @@ function consoleApp() {
       });
     },
 
-    // ---------- command input ----------
     send() {
       const cmd = this.input.replace(/\s+$/, '');
       if (!cmd) return;
@@ -321,6 +322,16 @@ function consoleApp() {
 
     clear() { this.blocks = []; },
 
+    openPort() {
+      const p = prompt("Port to tunnel on the client:");
+      if (!p) return;
+      if (!/^\d+$/.test(p) || +p < 1 || +p > 65535) {
+        this.sys("invalid port");
+        return;
+      }
+      window.open(`/t/${p}/`, "_blank", "noopener");
+    },
+
     scrollDown() {
       this.$nextTick(() => {
         const el = this.$refs.out;
@@ -328,7 +339,6 @@ function consoleApp() {
       });
     },
 
-    // ---------- file panel ----------
     togglePanel() {
       this.panel.open = !this.panel.open;
       if (this.panel.open) this.reloadToCwd();
@@ -341,7 +351,7 @@ function consoleApp() {
         if (res.error) this.sys(`cwd: ${res.error}`);
         return;
       }
-      const root = {
+      this.panel.root = {
         name: res.cwd,
         path: res.cwd,
         type: 'dir',
@@ -349,8 +359,7 @@ function consoleApp() {
         expanded: true,
         loading: false,
       };
-      this.panel.root = root;
-      await this.loadDir(root);
+      await this.loadDir(this.panel.root);
     },
 
     async loadDir(node) {
@@ -415,7 +424,6 @@ function consoleApp() {
       return (i === 0 ? v : v.toFixed(v < 10 ? 1 : 0)) + ' ' + u[i];
     },
 
-    // ---------- transfer ----------
     async downloadFile(node) {
       if (!node || node.type !== 'file') return;
       this.sys(`downloading ${node.name}…`);
