@@ -740,6 +740,8 @@ async def main() -> None:
             log("connection closed")
         except asyncio.CancelledError:
             raise
+        except websockets.ConnectionClosed as e:
+            log(f"closed: code={e.code} reason={e.reason!r}")
         except Exception as e:
             log(f"{type(e).__name__}: {e}")
 
