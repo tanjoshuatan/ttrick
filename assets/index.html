@@ -240,6 +240,9 @@ function consoleApp() {
     },
 
     handle(m) {
+      // Ignore anything tagged for a different session.
+      if (m.sid && m.sid !== this.sid) return;
+
       for (const h of this.rpcWaiters.slice()) {
         if (h(m)) {
           const i = this.rpcWaiters.indexOf(h);
@@ -249,13 +252,6 @@ function consoleApp() {
       }
 
       switch (m.type) {
-        case 'sid':
-          // server may assign a different sid if query was missing
-          if (m.sid && m.sid !== this.sid) {
-            this.sid = m.sid;
-            sessionStorage.setItem('ws-relay-sid', m.sid);
-          }
-          break;
         case 'status':
           this.agentOnline = m.agent === 'connected';
           if (!this.agentOnline) { this.agentInfo = ''; this.panel.root = null; }
@@ -297,6 +293,7 @@ function consoleApp() {
         let done = false;
         const handler = (m) => {
           if (m.type !== expected || m.id !== id) return false;
+          if (m.sid && m.sid !== this.sid) return false;
           done = true;
           resolve(m);
           return true;
@@ -308,7 +305,7 @@ function consoleApp() {
           if (i >= 0) this.rpcWaiters.splice(i, 1);
           resolve({ error: 'timeout' });
         }, timeoutMs);
-        this.ws.send(JSON.stringify({ type, id, ...payload }));
+        this.ws.send(JSON.stringify({ type, id, sid: this.sid, ...payload }));
       });
     },
 
@@ -323,7 +320,7 @@ function consoleApp() {
         : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
       this.blocks.push({ uid: ++this.uid, kind: 'cmd', id, cmd, out: '', err: '', exit: null, done: false, running: true });
-      this.ws.send(JSON.stringify({ type: 'command', id, cmd }));
+      this.ws.send(JSON.stringify({ type: 'command', id, sid: this.sid, cmd }));
 
       if (this.history[this.history.length - 1] !== cmd) this.history.push(cmd);
       this.histIdx = this.history.length;
@@ -334,7 +331,7 @@ function consoleApp() {
 
     interrupt(b) {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-      this.ws.send(JSON.stringify({ type: 'command_interrupt', id: b.id }));
+      this.ws.send(JSON.stringify({ type: 'command_interrupt', id: b.id, sid: this.sid }));
     },
 
     hist(dir) {

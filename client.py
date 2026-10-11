@@ -149,8 +149,8 @@ class PersistentShell:
 
         try:
             attrs = termios.tcgetattr(slave)
-            attrs[3] &= ~(termios.ECHO | termios.ECHONL)
-            attrs[1] &= ~termios.ONLCR
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL)   # lflag: no echo
+            attrs[1] &= ~termios.ONLCR                     # oflag: no \n → \r\n
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         except Exception as e:
@@ -679,6 +679,7 @@ async def session(url: str) -> None:
             if shell is None:
                 shell = PersistentShell(ws, send_lock, sid)
                 shells[sid] = shell
+                log(f"shell open: {sid[:8]}")
                 await shell.start()
             return shell
 
@@ -700,15 +701,6 @@ async def session(url: str) -> None:
                     q = active_tunnels.get(m.get("id"))
                     if q:
                         await q.put(m)
-                elif t == "session_open":
-                    if sid and sid not in shells:
-                        log(f"session open: {sid}")
-                        await get_shell(sid)
-                elif t == "session_close":
-                    shell = shells.pop(sid, None)
-                    if shell:
-                        log(f"session close: {sid}")
-                        await shell.stop()
                 elif t == "command":
                     if not sid:
                         continue

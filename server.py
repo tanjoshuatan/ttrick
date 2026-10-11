@@ -19,27 +19,17 @@ HOP_BY_HOP = {
 }
 
 MAX_BODY = 32 * 1024 * 1024
-SID_GRACE_SECONDS = 60.0
 
 HEARTBEAT_INTERVAL = 20.0
 HEARTBEAT_TIMEOUT = 60.0
 
 log = logging.getLogger("host")
 
-sessions: dict[str, "Session"] = {}
+uis: set[web.WebSocketResponse] = set()
 agent_ws: web.WebSocketResponse | None = None
 agent_hello: dict = {}
 agent_last_seen: float = 0.0
 tunnels: dict[str, "Tunnel"] = {}
-
-
-class Session:
-    __slots__ = ("sid", "uis", "close_task")
-
-    def __init__(self, sid: str):
-        self.sid = sid
-        self.uis: set[web.WebSocketResponse] = set()
-        self.close_task: asyncio.Task | None = None
 
 
 class Tunnel:
@@ -62,39 +52,18 @@ async def _send(ws: web.WebSocketResponse, payload: dict) -> None:
         pass
 
 
-async def _broadcast_session(sess: Session, payload: dict) -> None:
-    if not sess.uis:
+async def _broadcast_uis(payload: dict) -> None:
+    if not uis:
         return
     data = json.dumps(payload)
-    await asyncio.gather(*(ws.send_str(data) for ws in list(sess.uis)), return_exceptions=True)
-
-
-async def _broadcast_all_uis(payload: dict) -> None:
-    all_uis: list[web.WebSocketResponse] = []
-    for sess in sessions.values():
-        all_uis.extend(sess.uis)
-    if not all_uis:
-        return
-    data = json.dumps(payload)
-    await asyncio.gather(*(ws.send_str(data) for ws in all_uis), return_exceptions=True)
+    await asyncio.gather(*(ws.send_str(data) for ws in list(uis)), return_exceptions=True)
 
 
 async def push_status() -> None:
-    await _broadcast_all_uis({"type": "status", "agent": "connected" if agent_ws else "disconnected"})
-
-
-async def _close_session_after(sid: str) -> None:
-    await asyncio.sleep(SID_GRACE_SECONDS)
-    sess = sessions.get(sid)
-    if sess is None or sess.uis:
-        return
-    sessions.pop(sid, None)
-    if agent_ws is not None:
-        await _send(agent_ws, {"type": "session_close", "sid": sid})
+    await _broadcast_uis({"type": "status", "agent": "connected" if agent_ws else "disconnected"})
 
 
 async def _agent_watchdog(ws: web.WebSocketResponse) -> None:
-    """Drop the client if we haven't heard anything in HEARTBEAT_TIMEOUT seconds."""
     try:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -324,12 +293,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 if t == "hello":
                     agent_hello.clear()
                     agent_hello.update(m)
-                    await _broadcast_all_uis({
-                        "type": "hello",
-                        "host": m.get("host"),
-                    })
-                    for sid in list(sessions.keys()):
-                        await _send(ws, {"type": "session_open", "sid": sid})
+                    await _broadcast_uis({"type": "hello", "host": m.get("host")})
                     continue
 
                 if t.startswith("tunnel_"):
@@ -357,13 +321,9 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         await tunnel.body_queue.put(None)
                     continue
 
-                sid = m.get("sid")
-                if not sid:
-                    continue
-                sess = sessions.get(sid)
-                if sess is None:
-                    continue
-                await _broadcast_session(sess, m)
+                # Everything else (output, exit, fs_*_result) is broadcast to all UIs.
+                # The sid field rides along; UIs filter by it.
+                await _broadcast_uis(m)
         finally:
             wd.cancel()
             try:
@@ -378,25 +338,11 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         return ws
 
     # -------- ui --------
-    sid = request.query.get("sid") or uuid.uuid4().hex
-    sess = sessions.get(sid)
-    is_new = sess is None
-    if sess is None:
-        sess = Session(sid)
-        sessions[sid] = sess
-    if sess.close_task is not None:
-        sess.close_task.cancel()
-        sess.close_task = None
-    sess.uis.add(ws)
-
+    uis.add(ws)
     try:
-        await _send(ws, {"type": "sid", "sid": sid})
         await _send(ws, {"type": "status", "agent": "connected" if agent_ws else "disconnected"})
         if agent_hello:
             await _send(ws, {"type": "hello", "host": agent_hello.get("host")})
-
-        if is_new and agent_ws is not None:
-            await _send(agent_ws, {"type": "session_open", "sid": sid})
 
         async for msg in ws:
             if msg.type is not WSMsgType.TEXT:
@@ -407,9 +353,11 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 continue
 
             t = m.get("type", "")
+            sid = m.get("sid")
+
             if agent_ws is None:
                 if t == "command":
-                    await _send(ws, {"type": "exit", "id": m.get("id"), "code": 127})
+                    await _send(ws, {"type": "exit", "sid": sid, "id": m.get("id"), "code": 127})
                 elif t.startswith("fs_"):
                     rt = {
                         "fs_cwd": "fs_cwd_result",
@@ -418,17 +366,14 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         "fs_put": "fs_put_result",
                     }.get(t)
                     if rt:
-                        await _send(ws, {"type": rt, "id": m.get("id"), "error": "client offline"})
+                        await _send(ws, {"type": rt, "sid": sid, "id": m.get("id"), "error": "client offline"})
                 continue
 
-            m2 = dict(m)
-            m2["sid"] = sid
-            await _send(agent_ws, m2)
+            # Relay verbatim to the single agent. sid is already in the payload.
+            await _send(agent_ws, m)
     finally:
-        sess.uis.discard(ws)
-        if not sess.uis:
-            sess.close_task = asyncio.create_task(_close_session_after(sid))
-        log.info("ui disconnected (%s, sid=%s)", peer, sid)
+        uis.discard(ws)
+        log.info("ui disconnected (%s)", peer)
     return ws
 
 
@@ -444,7 +389,7 @@ def main() -> None:
     app.router.add_get("/healthz", lambda _: web.json_response({
         "ok": True,
         "agent": agent_ws is not None,
-        "sessions": len(sessions),
+        "uis": len(uis),
     }))
     app.router.add_get("/t/{port}", handle_tunnel_root)
     app.router.add_route("*", "/t/{port}/{path:.*}", handle_tunnel)
