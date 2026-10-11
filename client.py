@@ -30,6 +30,8 @@ RETRY_MIN = 1.0
 RETRY_MAX = 15.0
 MAX_TRANSFER = 32 * 1024 * 1024
 
+HEARTBEAT_INTERVAL = 20.0
+
 _delay = RETRY_MIN
 
 
@@ -147,8 +149,8 @@ class PersistentShell:
 
         try:
             attrs = termios.tcgetattr(slave)
-            attrs[3] &= ~(termios.ECHO | termios.ECHONL)   # lflag: no echo
-            attrs[1] &= ~termios.ONLCR                     # oflag: no \n → \r\n
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL)
+            attrs[1] &= ~termios.ONLCR
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         except Exception as e:
@@ -427,6 +429,19 @@ async def _send_msg(ws, send_lock: asyncio.Lock, payload: dict, sid: str | None 
             pass
 
 
+async def _heartbeat_loop(ws, send_lock: asyncio.Lock) -> None:
+    """Send an application-level ping every HEARTBEAT_INTERVAL seconds."""
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            async with send_lock:
+                await ws.send(json.dumps({"type": "ping"}))
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+
+
 # ---------------------------------------------------------------- fs handlers
 
 async def handle_fs_cwd(shell, ws, send_lock, m):
@@ -636,7 +651,13 @@ async def _do_ws_tunnel(ws, send_lock, m, active_tunnels: dict):
 async def session(url: str) -> None:
     global _delay
 
-    async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+    async with websockets.connect(
+        url,
+        ping_interval=None,
+        ping_timeout=None,
+        max_size=None,
+        additional_headers={"ngrok-skip-browser-warning": "true"},
+    ) as ws:
         _delay = RETRY_MIN
         log(f"connected to {url}")
 
@@ -647,6 +668,8 @@ async def session(url: str) -> None:
                 "host": socket.gethostname(),
                 "shell": "cmd" if IS_WINDOWS else "bash",
             }))
+
+        hb = asyncio.create_task(_heartbeat_loop(ws, send_lock))
 
         shells: dict[str, PersistentShell] = {}
         active_tunnels: dict[str, asyncio.Queue] = {}
@@ -668,6 +691,8 @@ async def session(url: str) -> None:
                 t = m.get("type")
                 sid = m.get("sid")
 
+                if t == "pong":
+                    continue
                 if t == "tunnel_open":
                     log(f"tunnel: {m.get('kind')} :{m.get('port')}{m.get('path','')}")
                     asyncio.create_task(handle_tunnel_open(ws, send_lock, m, active_tunnels))
@@ -708,6 +733,11 @@ async def session(url: str) -> None:
                 elif t == "fs_put":
                     asyncio.create_task(handle_fs_put(ws, send_lock, m))
         finally:
+            hb.cancel()
+            try:
+                await hb
+            except (asyncio.CancelledError, Exception):
+                pass
             for q in active_tunnels.values():
                 await q.put({"type": "tunnel_close"})
             for shell in list(shells.values()):

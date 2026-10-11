@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 import uuid
 from pathlib import Path
 
@@ -20,11 +21,15 @@ HOP_BY_HOP = {
 MAX_BODY = 32 * 1024 * 1024
 SID_GRACE_SECONDS = 60.0
 
+HEARTBEAT_INTERVAL = 20.0
+HEARTBEAT_TIMEOUT = 60.0
+
 log = logging.getLogger("host")
 
 sessions: dict[str, "Session"] = {}
 agent_ws: web.WebSocketResponse | None = None
 agent_hello: dict = {}
+agent_last_seen: float = 0.0
 tunnels: dict[str, "Tunnel"] = {}
 
 
@@ -86,6 +91,24 @@ async def _close_session_after(sid: str) -> None:
     sessions.pop(sid, None)
     if agent_ws is not None:
         await _send(agent_ws, {"type": "session_close", "sid": sid})
+
+
+async def _agent_watchdog(ws: web.WebSocketResponse) -> None:
+    """Drop the client if we haven't heard anything in HEARTBEAT_TIMEOUT seconds."""
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            if agent_ws is not ws:
+                return
+            if time.monotonic() - agent_last_seen > HEARTBEAT_TIMEOUT:
+                log.warning("agent silent for %.0fs — closing", HEARTBEAT_TIMEOUT)
+                try:
+                    await ws.close(code=4000, message=b"heartbeat timeout")
+                except Exception:
+                    pass
+                return
+    except asyncio.CancelledError:
+        return
 
 
 # ---------------------------------------------------------------- static
@@ -213,7 +236,7 @@ async def _tunnel_ws(request: web.Request, agent, port: str, path: str) -> web.S
         if tunnel.error:
             return web.Response(status=502, text=tunnel.error)
 
-        ws_browser = web.WebSocketResponse(heartbeat=30, max_msg_size=0)
+        ws_browser = web.WebSocketResponse(heartbeat=None, max_msg_size=0)
         await ws_browser.prepare(request)
 
         async def b2u() -> None:
@@ -259,8 +282,8 @@ async def _tunnel_ws(request: web.Request, agent, port: str, path: str) -> web.S
 # ---------------------------------------------------------------- ws
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:
-    global agent_ws
-    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=0)
+    global agent_ws, agent_last_seen
+    ws = web.WebSocketResponse(heartbeat=None, max_msg_size=0)
     await ws.prepare(request)
 
     role = request.query.get("role", "ui")
@@ -271,23 +294,32 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     if role == "client":
         old = agent_ws
         agent_ws = ws
-        if old is not None and old is not ws:
+        agent_last_seen = time.monotonic()
+        if old is not None and old is not ws and not old.closed:
             try:
                 await old.close()
             except Exception:
                 pass
         await push_status()
 
+        wd = asyncio.create_task(_agent_watchdog(ws))
+
         try:
             async for msg in ws:
                 if msg.type is not WSMsgType.TEXT:
                     continue
+                agent_last_seen = time.monotonic()
+
                 try:
                     m = json.loads(msg.data)
                 except json.JSONDecodeError:
                     continue
 
                 t = m.get("type", "")
+
+                if t == "ping":
+                    await _send(ws, {"type": "pong"})
+                    continue
 
                 if t == "hello":
                     agent_hello.clear()
@@ -296,7 +328,6 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                         "type": "hello",
                         "host": m.get("host"),
                     })
-                    # (Re)open all live sessions on this client
                     for sid in list(sessions.keys()):
                         await _send(ws, {"type": "session_open", "sid": sid})
                     continue
@@ -334,6 +365,11 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                     continue
                 await _broadcast_session(sess, m)
         finally:
+            wd.cancel()
+            try:
+                await wd
+            except (asyncio.CancelledError, Exception):
+                pass
             if agent_ws is ws:
                 agent_ws = None
                 agent_hello.clear()
@@ -405,7 +441,11 @@ def main() -> None:
     app = web.Application(client_max_size=MAX_BODY)
     app.router.add_get("/", handle_index)
     app.router.add_get("/ws", handle_ws)
-    app.router.add_get("/healthz", lambda _: web.json_response({"ok": True, "agent": agent_ws is not None, "sessions": len(sessions)}))
+    app.router.add_get("/healthz", lambda _: web.json_response({
+        "ok": True,
+        "agent": agent_ws is not None,
+        "sessions": len(sessions),
+    }))
     app.router.add_get("/t/{port}", handle_tunnel_root)
     app.router.add_route("*", "/t/{port}/{path:.*}", handle_tunnel)
     log.info("host listening on http://0.0.0.0:8080")
