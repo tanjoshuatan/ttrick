@@ -149,6 +149,7 @@ class PersistentShell:
         env["PS1"] = ""
         env["PS2"] = ""
         env["PROMPT_COMMAND"] = ""
+        env["PYTHONUNBUFFERED"] = "1"       # <-- add this
 
         def _child_setup():
             os.setsid()

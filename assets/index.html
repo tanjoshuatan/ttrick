@@ -146,7 +146,7 @@
     <div class="flex items-start gap-2 font-mono text-[13px]">
       <span class="select-none pt-1.5 text-emerald-400">$</span>
       <textarea x-ref="input" x-model="input" spellcheck="false" autocomplete="off"
-                placeholder="ls -la   (Shift+Enter for newline)"
+                placeholder="Enter Command Here (Shift+Enter for newline)"
                 rows="1"
                 @keydown.enter="onEnter($event)"
                 @keydown.up.prevent="hist(-1)"
