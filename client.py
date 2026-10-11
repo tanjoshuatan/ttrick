@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import platform
@@ -15,6 +16,7 @@ HOST_FILE = HERE / "host.txt"
 
 RETRY_MIN = 1.0
 RETRY_MAX = 15.0
+MAX_TRANSFER = 32 * 1024 * 1024  # 32 MB cap per file transfer
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -67,7 +69,7 @@ class PersistentShell:
         self.proc: asyncio.subprocess.Process | None = None
         self.pump_task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
-        self.current: dict | None = None  # {id, marker, event}
+        self.current: dict | None = None
 
     async def _send(self, payload: dict) -> None:
         async with self.send_lock:
@@ -78,7 +80,6 @@ class PersistentShell:
 
     async def start(self) -> None:
         if IS_WINDOWS:
-            # /Q = quiet (no echo, no banner), /V:ON = delayed expansion for !errorlevel!
             self.proc = await asyncio.create_subprocess_exec(
                 "cmd.exe", "/Q", "/V:ON",
                 stdin=asyncio.subprocess.PIPE,
@@ -97,31 +98,42 @@ class PersistentShell:
         await self._prime()
 
     async def _prime(self) -> None:
-        """Consume any startup banner so it doesn't pollute the first real command."""
         marker = f"__RELAY_PRIME_{uuid.uuid4().hex}__"
         payload = f"echo {marker}\r\n" if IS_WINDOWS else f"printf '{marker}\\n'\n"
         event = asyncio.Event()
-        self.current = {"id": "__prime__", "marker": marker, "event": event}
+        self.current = {"id": "__prime__", "marker": marker, "event": event, "capture": []}
         assert self.proc and self.proc.stdin
         self.proc.stdin.write(payload.encode())
         await self.proc.stdin.drain()
         await event.wait()
+
+    async def _emit(self, data: str, stream: str = "stdout") -> None:
+        cur = self.current
+        if cur is None:
+            return
+        if cur.get("capture") is not None:
+            cur["capture"].append(data)
+        else:
+            await self._send({
+                "type": "output",
+                "id": cur["id"],
+                "stream": stream,
+                "data": data,
+            })
 
     async def _pump(self) -> None:
         assert self.proc is not None
 
         async def stderr_pump() -> None:
             while True:
-                chunk = await self.proc.stderr.read(4096)
+                try:
+                    chunk = await self.proc.stderr.read(4096)
+                except Exception:
+                    return
                 if not chunk:
                     return
                 if self.current:
-                    await self._send({
-                        "type": "output",
-                        "id": self.current["id"],
-                        "stream": "stderr",
-                        "data": chunk.decode("utf-8", errors="replace"),
-                    })
+                    await self._emit(chunk.decode("utf-8", errors="replace"), "stderr")
 
         stderr_task = asyncio.create_task(stderr_pump())
 
@@ -133,7 +145,6 @@ class PersistentShell:
                     break
                 buf += chunk.decode("utf-8", errors="replace")
 
-                # Between commands, discard stray bytes (background jobs etc.)
                 if self.current is None:
                     buf = ""
                     continue
@@ -143,41 +154,21 @@ class PersistentShell:
                     idx = buf.find(marker)
 
                     if idx == -1:
-                        # Flush everything except a possible partial marker at the tail
                         keep = len(marker) - 1
-                        if keep and len(buf) > keep:
+                        if len(buf) > keep:
                             out, buf = buf[:len(buf) - keep], buf[len(buf) - keep:]
                             if out:
-                                await self._send({
-                                    "type": "output",
-                                    "id": self.current["id"],
-                                    "stream": "stdout",
-                                    "data": out,
-                                })
-                        elif not keep and buf:
-                            await self._send({
-                                "type": "output",
-                                "id": self.current["id"],
-                                "stream": "stdout",
-                                "data": buf,
-                            })
-                            buf = ""
+                                await self._emit(out)
                         break
 
-                    # Flush the output that preceded the marker
                     out = buf[:idx]
                     if out:
-                        await self._send({
-                            "type": "output",
-                            "id": self.current["id"],
-                            "stream": "stdout",
-                            "data": out,
-                        })
+                        await self._emit(out)
 
                     rest = buf[idx + len(marker):]
                     nl = rest.find("\n")
                     if nl == -1:
-                        break  # marker matched but code not yet readable
+                        break
 
                     code_str = rest[:nl].strip()
                     try:
@@ -187,7 +178,9 @@ class PersistentShell:
 
                     cur = self.current
                     self.current = None
-                    await self._send({"type": "exit", "id": cur["id"], "code": code})
+                    cur["code"] = code
+                    if cur.get("capture") is None:
+                        await self._send({"type": "exit", "id": cur["id"], "code": code})
                     cur["event"].set()
                     buf = rest[nl + 1:]
         finally:
@@ -207,7 +200,6 @@ class PersistentShell:
             self.current = {"id": cmd_id, "marker": marker, "event": event}
 
             if IS_WINDOWS:
-                # cmd.exe doesn't take raw newlines well via stdin — chain with &
                 oneline = cmd.replace("\r\n", "\n").replace("\n", " & ")
                 payload = f"{oneline} & echo {marker}!errorlevel!\r\n"
             else:
@@ -229,6 +221,43 @@ class PersistentShell:
 
             await event.wait()
 
+    async def capture(self, cmd: str) -> tuple[str, int]:
+        """Run a command silently and return (stdout+stderr, exit code)."""
+        async with self.lock:
+            if self.proc is None or self.proc.returncode is not None:
+                await self.start()
+
+            marker = f"__RELAY_CAP_{uuid.uuid4().hex}__"
+            event = asyncio.Event()
+            buf: list[str] = []
+            cur_ref: dict = {"id": "__capture__", "marker": marker, "event": event, "capture": buf}
+            self.current = cur_ref
+
+            if IS_WINDOWS:
+                oneline = cmd.replace("\r\n", "\n").replace("\n", " & ")
+                payload = f"{oneline} & echo {marker}!errorlevel!\r\n"
+            else:
+                payload = f"{cmd}\nprintf '\\n{marker}%d\\n' $?\n"
+
+            try:
+                assert self.proc and self.proc.stdin
+                self.proc.stdin.write(payload.encode("utf-8"))
+                await self.proc.stdin.drain()
+            except Exception:
+                self.current = None
+                raise
+
+            await event.wait()
+            return "".join(buf), cur_ref.get("code", -1)
+
+    async def get_cwd(self) -> str:
+        if IS_WINDOWS:
+            out, _ = await self.capture("cd")
+        else:
+            out, _ = await self.capture("pwd")
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        return lines[-1].strip() if lines else os.getcwd()
+
     async def stop(self) -> None:
         if self.proc and self.proc.returncode is None:
             try:
@@ -248,6 +277,89 @@ class PersistentShell:
                 await self.pump_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+
+# ---------------------------------------------------------------- fs handlers
+
+async def _send_msg(ws, send_lock: asyncio.Lock, payload: dict) -> None:
+    async with send_lock:
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception:
+            pass
+
+
+async def handle_fs_cwd(shell: PersistentShell, ws, send_lock, m: dict) -> None:
+    try:
+        cwd = await shell.get_cwd()
+        await _send_msg(ws, send_lock, {"type": "fs_cwd_result", "id": m["id"], "cwd": cwd})
+    except Exception as e:
+        await _send_msg(ws, send_lock, {"type": "fs_cwd_result", "id": m["id"], "error": str(e)})
+
+
+async def handle_fs_list(ws, send_lock, m: dict) -> None:
+    path = m.get("path", "/")
+    try:
+        entries = []
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    is_dir = e.is_dir()
+                    size = 0 if is_dir else e.stat().st_size
+                except OSError:
+                    is_dir, size = False, 0
+                entries.append({
+                    "name": e.name,
+                    "path": os.path.join(path, e.name),
+                    "type": "dir" if is_dir else "file",
+                    "size": size,
+                })
+        entries.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
+        await _send_msg(ws, send_lock, {
+            "type": "fs_list_result", "id": m["id"], "path": path, "entries": entries,
+        })
+    except OSError as e:
+        await _send_msg(ws, send_lock, {
+            "type": "fs_list_result", "id": m["id"], "path": path, "error": str(e), "entries": [],
+        })
+
+
+async def handle_fs_get(ws, send_lock, m: dict) -> None:
+    path = m.get("path", "")
+    try:
+        st = os.stat(path)
+        if st.st_size > MAX_TRANSFER:
+            raise OSError(f"file too large ({st.st_size} bytes > {MAX_TRANSFER})")
+        with open(path, "rb") as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode("ascii")
+        await _send_msg(ws, send_lock, {
+            "type": "fs_get_result", "id": m["id"], "path": path, "data": b64, "size": len(data),
+        })
+    except OSError as e:
+        await _send_msg(ws, send_lock, {
+            "type": "fs_get_result", "id": m["id"], "path": path, "error": str(e),
+        })
+
+
+async def handle_fs_put(ws, send_lock, m: dict) -> None:
+    path = m.get("path", "")
+    try:
+        data = base64.b64decode(m.get("data", ""))
+        if len(data) > MAX_TRANSFER:
+            raise OSError(f"payload too large ({len(data)} bytes > {MAX_TRANSFER})")
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        await _send_msg(ws, send_lock, {
+            "type": "fs_put_result", "id": m["id"], "path": path, "ok": True, "size": len(data),
+        })
+    except Exception as e:
+        await _send_msg(ws, send_lock, {
+            "type": "fs_put_result", "id": m["id"], "path": path, "ok": False, "error": str(e),
+        })
 
 
 # ---------------------------------------------------------------- session
@@ -277,13 +389,18 @@ async def session(url: str) -> None:
                     m = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if m.get("type") != "command":
-                    continue
-                cmd = m.get("cmd") or ""
-                cmd_id = m.get("id")
-                log(f"exec: {cmd}")
-                # fire-and-forget; shell serializes internally
-                asyncio.create_task(shell.run(cmd_id, cmd))
+                t = m.get("type")
+                if t == "command":
+                    log(f"exec: {m.get('cmd','')}")
+                    asyncio.create_task(shell.run(m["id"], m.get("cmd") or ""))
+                elif t == "fs_cwd":
+                    asyncio.create_task(handle_fs_cwd(shell, ws, send_lock, m))
+                elif t == "fs_list":
+                    asyncio.create_task(handle_fs_list(ws, send_lock, m))
+                elif t == "fs_get":
+                    asyncio.create_task(handle_fs_get(ws, send_lock, m))
+                elif t == "fs_put":
+                    asyncio.create_task(handle_fs_put(ws, send_lock, m))
         finally:
             await shell.stop()
 

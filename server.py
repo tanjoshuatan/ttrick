@@ -94,11 +94,20 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 m = json.loads(msg.data)
             except json.JSONDecodeError:
                 continue
-            if m.get("type") != "command":
-                continue
-
+            
+            t = m.get("type", "")
             if not agents:
-                await _send(ws, {"type": "exit", "id": m.get("id"), "code": 127})
+                if t == "command":
+                    await _send(ws, {"type": "exit", "id": m.get("id"), "code": 127})
+                elif t.startswith("fs_"):
+                    rt = {
+                        "fs_cwd": "fs_cwd_result",
+                        "fs_list": "fs_list_result",
+                        "fs_get": "fs_get_result",
+                        "fs_put": "fs_put_result",
+                    }.get(t)
+                    if rt:
+                        await _send(ws, {"type": rt, "id": m.get("id"), "error": "client offline"})
                 continue
 
             data = json.dumps(m)

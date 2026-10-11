@@ -11,12 +11,17 @@
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 9999px; }
   ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+  [x-cloak] { display: none !important; }
 </style>
 </head>
 <body class="h-full bg-neutral-950 text-neutral-200 antialiased">
-<div x-data="consoleApp()" class="flex h-full flex-col">
+<div x-data="consoleApp()" class="flex h-full flex-col" @keydown.escape.window="panel.open = false">
 
-  <header class="flex items-center gap-5 border-b border-neutral-800 bg-neutral-900/60 px-4 py-2.5">
+  <header class="flex items-center gap-4 border-b border-neutral-800 bg-neutral-900/60 px-4 py-2.5">
+    <button @click="togglePanel()"
+            class="rounded-md border border-neutral-700 px-2.5 py-1 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100"
+            title="Files">☰</button>
+
     <div class="flex items-center gap-2">
       <span class="h-2.5 w-2.5 rounded-full" :class="uiConnected ? 'bg-emerald-400' : 'bg-red-500'"></span>
       <span class="text-sm font-medium">host</span>
@@ -27,11 +32,76 @@
       <span class="text-sm font-medium">client</span>
       <span class="text-xs text-neutral-500" x-text="agentOnline ? (agentInfo || 'online') : 'offline'"></span>
     </div>
+
     <button @click="clear()"
             class="ml-auto rounded-md border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">
       clear
     </button>
   </header>
+
+  <!-- file panel backdrop -->
+  <div x-show="panel.open" x-cloak @click="panel.open = false"
+       class="fixed inset-0 z-30 bg-black/50"></div>
+
+  <!-- file panel -->
+  <aside x-show="panel.open" x-cloak
+         class="fixed left-0 top-0 bottom-0 z-40 flex w-80 max-w-[85vw] flex-col border-r border-neutral-800 bg-neutral-900 shadow-2xl sm:w-96">
+    <div class="flex items-center gap-2 border-b border-neutral-800 px-3 py-2">
+      <div class="min-w-0 flex-1">
+        <div class="text-[10px] uppercase tracking-wide text-neutral-500">terminal cwd</div>
+        <div class="truncate font-mono text-xs text-neutral-300" x-text="panel.root ? panel.root.path : '…'"></div>
+      </div>
+      <button @click="reloadToCwd()" title="Reload to terminal cwd"
+              class="rounded border border-neutral-700 px-2 py-1 text-neutral-300 hover:bg-neutral-800">⟳</button>
+      <button @click="triggerUpload(panel.root && panel.root.path)" title="Upload here"
+              class="rounded border border-neutral-700 px-2 py-1 text-neutral-300 hover:bg-neutral-800">⬆</button>
+      <button @click="panel.open = false" title="Close"
+              class="rounded border border-neutral-700 px-2 py-1 text-neutral-400 hover:bg-neutral-800">✕</button>
+    </div>
+
+    <div class="flex-1 overflow-y-auto py-1 font-mono text-[12px]">
+      <template x-for="item in flattenTree()" :key="item.node.path">
+        <div class="group flex items-center gap-1 rounded px-1.5 py-0.5 hover:bg-neutral-800/70"
+             :style="'padding-left: ' + (item.depth * 12 + 6) + 'px'">
+
+          <template x-if="item.node.type === 'dir'">
+            <div class="flex min-w-0 flex-1 items-center gap-1">
+              <span class="w-3 cursor-pointer select-none text-neutral-500"
+                    @click="toggleDir(item.node)"
+                    x-text="item.node.expanded ? '▾' : '▸'"></span>
+              <span class="cursor-pointer truncate"
+                    @click="toggleDir(item.node)"
+                    x-text="'📁 ' + item.node.name"></span>
+              <button @click.stop="triggerUpload(item.node.path)"
+                      class="ml-auto shrink-0 rounded px-1 text-neutral-500 opacity-0 hover:bg-neutral-700 hover:text-neutral-200 group-hover:opacity-100"
+                      title="Upload into this folder">⬆</button>
+            </div>
+          </template>
+
+          <template x-if="item.node.type === 'file'">
+            <div class="flex min-w-0 flex-1 cursor-pointer items-center gap-1"
+                 @click="downloadFile(item.node)">
+              <span class="w-3"></span>
+              <span class="truncate" x-text="'📄 ' + item.node.name"></span>
+              <span class="ml-auto shrink-0 pl-2 text-[10px] text-neutral-500"
+                    x-text="fmtSize(item.node.size)"></span>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <div x-show="panel.root && panel.root.loading" class="px-3 py-2 text-xs text-neutral-500">loading…</div>
+      <div x-show="panel.root && !panel.root.loading && panel.root.children && panel.root.children.length === 0"
+           class="px-3 py-2 text-xs text-neutral-500">(empty)</div>
+      <div x-show="!panel.root" class="px-3 py-2 text-xs text-neutral-500">waiting for client…</div>
+    </div>
+
+    <div class="border-t border-neutral-800 px-3 py-1.5 text-[10px] text-neutral-500">
+      tap 📄 to download · ⬆ to upload
+    </div>
+  </aside>
+
+  <input x-ref="fileInput" type="file" multiple class="hidden" @change="onFileSelected($event)" />
 
   <main x-ref="out" class="flex-1 overflow-y-auto px-4 py-3 font-mono text-[13px] leading-relaxed">
     <template x-for="b in blocks" :key="b.uid">
@@ -90,18 +160,20 @@ function consoleApp() {
     uid: 0,
     reconnectDelay: 500,
 
+    rpcWaiters: [],
+    uploadTarget: '',
+    panel: {
+      open: false,
+      root: null,   // { name, path, type:'dir', children, expanded, loading }
+    },
+
     init() {
       this.connect();
-      this.$nextTick(() => {
-        this.focus();
-        this.autosize();
-      });
+      this.$nextTick(() => { this.focus(); this.autosize(); });
       this.$watch('input', () => this.autosize());
     },
 
-    focus() {
-      if (this.$refs.input) this.$refs.input.focus();
-    },
+    focus() { if (this.$refs.input) this.$refs.input.focus(); },
 
     autosize() {
       this.$nextTick(() => {
@@ -113,7 +185,7 @@ function consoleApp() {
     },
 
     onEnter(e) {
-      if (e.shiftKey) return;          // Shift+Enter -> default (insert newline)
+      if (e.shiftKey) return;
       e.preventDefault();
       this.send();
     },
@@ -139,6 +211,7 @@ function consoleApp() {
         this.uiConnected = false;
         this.agentOnline = false;
         this.agentInfo = '';
+        this.panel.root = null;
         this.sys('host connection lost — retrying…');
         setTimeout(() => this.connect(), this.reconnectDelay);
         this.reconnectDelay = Math.min(this.reconnectDelay * 2, 8000);
@@ -148,14 +221,24 @@ function consoleApp() {
     },
 
     handle(m) {
+      // RPC responses first
+      for (const h of this.rpcWaiters.slice()) {
+        if (h(m)) {
+          const i = this.rpcWaiters.indexOf(h);
+          if (i >= 0) this.rpcWaiters.splice(i, 1);
+          return;
+        }
+      }
+
       switch (m.type) {
         case 'status':
           this.agentOnline = m.agent === 'connected';
-          if (!this.agentOnline) this.agentInfo = '';
+          if (!this.agentOnline) { this.agentInfo = ''; this.panel.root = null; }
           this.sys(`client ${this.agentOnline ? 'connected' : 'disconnected'}`);
           break;
         case 'hello':
           this.agentInfo = [m.host, m.cwd].filter(Boolean).join(' · ');
+          if (this.panel.open) this.reloadToCwd();
           break;
         case 'output': {
           const b = this.blocks.find(x => x.id === m.id);
@@ -175,17 +258,41 @@ function consoleApp() {
       }
     },
 
+    // ---------- rpc ----------
+    rpc(type, payload = {}, timeoutMs = 15000) {
+      return new Promise((resolve) => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          resolve({ error: 'not connected' });
+          return;
+        }
+        const id = crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const expected = type + '_result';
+        let done = false;
+        const handler = (m) => {
+          if (m.type !== expected || m.id !== id) return false;
+          done = true;
+          resolve(m);
+          return true;
+        };
+        this.rpcWaiters.push(handler);
+        setTimeout(() => {
+          if (done) return;
+          const i = this.rpcWaiters.indexOf(handler);
+          if (i >= 0) this.rpcWaiters.splice(i, 1);
+          resolve({ error: 'timeout' });
+        }, timeoutMs);
+        this.ws.send(JSON.stringify({ type, id, ...payload }));
+      });
+    },
+
+    // ---------- command input ----------
     send() {
-      const cmd = this.input.replace(/\s+$/, '');   // trim trailing whitespace/newlines
+      const cmd = this.input.replace(/\s+$/, '');
       if (!cmd) return;
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        this.sys('not connected to host');
-        return;
-      }
-      if (!this.agentOnline) {
-        this.sys('client offline — command not sent');
-        return;
-      }
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) { this.sys('not connected to host'); return; }
+      if (!this.agentOnline) { this.sys('client offline — command not sent'); return; }
 
       const id = crypto.randomUUID
         ? crypto.randomUUID()
@@ -219,6 +326,158 @@ function consoleApp() {
         const el = this.$refs.out;
         if (el) el.scrollTop = el.scrollHeight;
       });
+    },
+
+    // ---------- file panel ----------
+    togglePanel() {
+      this.panel.open = !this.panel.open;
+      if (this.panel.open) this.reloadToCwd();
+    },
+
+    async reloadToCwd() {
+      if (!this.agentOnline) { this.panel.root = null; return; }
+      const res = await this.rpc('fs_cwd');
+      if (res.error || !res.cwd) {
+        if (res.error) this.sys(`cwd: ${res.error}`);
+        return;
+      }
+      const root = {
+        name: res.cwd,
+        path: res.cwd,
+        type: 'dir',
+        children: null,
+        expanded: true,
+        loading: false,
+      };
+      this.panel.root = root;
+      await this.loadDir(root);
+    },
+
+    async loadDir(node) {
+      node.loading = true;
+      const res = await this.rpc('fs_list', { path: node.path });
+      node.loading = false;
+      if (res.error) {
+        node.children = [];
+        this.sys(`list ${node.path}: ${res.error}`);
+        return;
+      }
+      node.children = (res.entries || []).map(e => ({
+        ...e, children: null, expanded: false, loading: false,
+      }));
+    },
+
+    async toggleDir(node) {
+      if (node.expanded) { node.expanded = false; return; }
+      if (node.children === null) await this.loadDir(node);
+      node.expanded = true;
+    },
+
+    async refreshPath(path) {
+      const node = this.findNodeByPath(path);
+      if (!node) return;
+      if (node.children === null) return;
+      await this.loadDir(node);
+    },
+
+    findNodeByPath(path) {
+      const walk = (n) => {
+        if (!n) return null;
+        if (n.path === path) return n;
+        if (n.children) for (const c of n.children) {
+          const r = walk(c);
+          if (r) return r;
+        }
+        return null;
+      };
+      return walk(this.panel.root);
+    },
+
+    flattenTree() {
+      const out = [];
+      const walk = (node, depth) => {
+        out.push({ node, depth });
+        if (node.type === 'dir' && node.expanded && node.children) {
+          for (const c of node.children) walk(c, depth + 1);
+        }
+      };
+      if (this.panel.root && this.panel.root.children) {
+        for (const c of this.panel.root.children) walk(c, 0);
+      }
+      return out;
+    },
+
+    fmtSize(n) {
+      if (!n || n < 0) return '';
+      const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let i = 0, v = n;
+      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+      return (i === 0 ? v : v.toFixed(v < 10 ? 1 : 0)) + ' ' + u[i];
+    },
+
+    // ---------- transfer ----------
+    async downloadFile(node) {
+      if (!node || node.type !== 'file') return;
+      this.sys(`downloading ${node.name}…`);
+      const res = await this.rpc('fs_get', { path: node.path }, 60000);
+      if (res.error || !res.data) {
+        this.sys(`download ${node.name}: ${res.error || 'no data'}`);
+        return;
+      }
+      const bin = atob(res.data);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const blob = new Blob([bytes]);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = node.name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      this.sys(`downloaded ${node.name} (${this.fmtSize(res.size)})`);
+    },
+
+    triggerUpload(dirPath) {
+      if (!dirPath) { this.sys('no target dir'); return; }
+      this.uploadTarget = dirPath;
+      this.$refs.fileInput.value = '';
+      this.$refs.fileInput.click();
+    },
+
+    async onFileSelected(e) {
+      const files = Array.from(e.target.files || []);
+      if (!files.length) return;
+      const dir = this.uploadTarget.replace(/[\\/]+$/, '');
+      for (const f of files) {
+        try {
+          const buf = await f.arrayBuffer();
+          const b64 = this.bufToB64(buf);
+          const sep = (dir.endsWith('/') || dir.endsWith('\\')) ? '' : (navigator.userAgent.includes('Win') ? '\\' : '/');
+          const path = dir + sep + f.name;
+          this.sys(`uploading ${f.name} (${this.fmtSize(f.size)}) → ${path}…`);
+          const res = await this.rpc('fs_put', { path, data: b64 }, 120000);
+          if (res.ok) {
+            this.sys(`uploaded ${f.name} (${this.fmtSize(res.size)})`);
+            await this.refreshPath(this.uploadTarget);
+          } else {
+            this.sys(`upload ${f.name}: ${res.error || 'failed'}`);
+          }
+        } catch (err) {
+          this.sys(`upload ${f.name}: ${err}`);
+        }
+      }
+    },
+
+    bufToB64(buf) {
+      const bytes = new Uint8Array(buf);
+      const chunk = 0x8000;
+      let s = '';
+      for (let i = 0; i < bytes.length; i += chunk) {
+        s += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      return btoa(s);
     },
   };
 }
