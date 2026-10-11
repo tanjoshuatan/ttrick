@@ -7,23 +7,28 @@ import json
 import os
 import platform
 import socket
+import subprocess
 import uuid
 from pathlib import Path
 
 import aiohttp
 import websockets
 
+IS_WINDOWS = platform.system() == "Windows"
+
+if not IS_WINDOWS:
+    import fcntl
+    import pty
+    import struct
+    import termios
+
 HERE = Path(__file__).resolve().parent
 DEFAULT_HOST_FILE = HERE / "host.txt"
-
-# Populated by parse_args() in main(). read_host_url() uses the global.
 HOST_FILE: Path = DEFAULT_HOST_FILE
 
 RETRY_MIN = 1.0
 RETRY_MAX = 15.0
 MAX_TRANSFER = 32 * 1024 * 1024
-
-IS_WINDOWS = platform.system() == "Windows"
 
 _delay = RETRY_MIN
 
@@ -40,9 +45,7 @@ def parse_args() -> argparse.Namespace:
         description="WS relay client — reads the host URL from a text file and reconnects on failure.",
     )
     p.add_argument(
-        "host_file",
-        nargs="?",
-        default=str(DEFAULT_HOST_FILE),
+        "host_file", nargs="?", default=str(DEFAULT_HOST_FILE),
         help=f"path to the file containing the host URL (default: {DEFAULT_HOST_FILE})",
     )
     return p.parse_args()
@@ -77,52 +80,134 @@ def to_ws_url(base: str) -> str:
     return f"{base}/ws?role=client"
 
 
+# ---------------------------------------------------------------- pty helper
+
+if not IS_WINDOWS:
+    class _PipeEndpoint:
+        __slots__ = ("_fd",)
+        def __init__(self, fd: int): self._fd = fd
+        def fileno(self) -> int: return self._fd
+        def close(self) -> None:
+            try: os.close(self._fd)
+            except OSError: pass
+
+
 # ---------------------------------------------------------------- shell
 
 class PersistentShell:
-    def __init__(self, ws, send_lock: asyncio.Lock):
+    """Persistent shell with a real pty on POSIX so Ctrl+C works."""
+
+    def __init__(self, ws, send_lock: asyncio.Lock, sid: str):
         self.ws = ws
         self.send_lock = send_lock
-        self.proc: asyncio.subprocess.Process | None = None
+        self.sid = sid
+        self.proc = None
+        self.master_fd: int | None = None
+        self.reader: asyncio.StreamReader | None = None
         self.pump_task: asyncio.Task | None = None
+        self.stderr_task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
         self.current: dict | None = None
 
     async def _send(self, payload: dict) -> None:
+        p = dict(payload)
+        p["sid"] = self.sid
         async with self.send_lock:
             try:
-                await self.ws.send(json.dumps(payload))
+                await self.ws.send(json.dumps(p))
             except Exception:
                 pass
 
+    def _proc_dead(self) -> bool:
+        if self.proc is None:
+            return True
+        if IS_WINDOWS:
+            return self.proc.returncode is not None
+        return self.proc.poll() is not None
+
     async def start(self) -> None:
         if IS_WINDOWS:
-            self.proc = await asyncio.create_subprocess_exec(
-                "cmd.exe", "/Q", "/V:ON",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            await self._start_windows()
         else:
-            self.proc = await asyncio.create_subprocess_exec(
-                "/bin/bash",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
+            await self._start_posix()
         self.pump_task = asyncio.create_task(self._pump())
         await self._prime()
+
+    async def _start_windows(self) -> None:
+        self.proc = await asyncio.create_subprocess_exec(
+            "cmd.exe", "/Q", "/V:ON",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self.reader = self.proc.stdout
+
+    async def _start_posix(self) -> None:
+        master, slave = pty.openpty()
+
+        try:
+            attrs = termios.tcgetattr(slave)
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL)   # lflag: no echo
+            attrs[1] &= ~termios.ONLCR                     # oflag: no \n → \r\n
+            termios.tcsetattr(slave, termios.TCSANOW, attrs)
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+        except Exception as e:
+            log(f"pty termios warning: {e}")
+
+        env = os.environ.copy()
+        env["TERM"] = "dumb"
+        env["PS1"] = ""
+        env["PS2"] = ""
+        env["PROMPT_COMMAND"] = ""
+
+        def _child_setup() -> None:
+            os.setsid()
+            try:
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            except OSError:
+                pass
+
+        self.proc = subprocess.Popen(
+            ["/bin/bash", "--norc", "--noprofile", "--noediting", "-i"],
+            stdin=slave, stdout=slave, stderr=slave,
+            env=env, preexec_fn=_child_setup, close_fds=True,
+        )
+        os.close(slave)
+
+        self.master_fd = os.dup(master)
+
+        loop = asyncio.get_event_loop()
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        await loop.connect_read_pipe(lambda: protocol, _PipeEndpoint(master))
+        self.reader = reader
 
     async def _prime(self) -> None:
         marker = f"__RELAY_PRIME_{uuid.uuid4().hex}__"
         payload = f"echo {marker}\r\n" if IS_WINDOWS else f"printf '{marker}\\n'\n"
         event = asyncio.Event()
         self.current = {"id": "__prime__", "marker": marker, "event": event, "capture": []}
-        assert self.proc and self.proc.stdin
-        self.proc.stdin.write(payload.encode())
-        await self.proc.stdin.drain()
+        await self._write(payload.encode())
         await event.wait()
+
+    async def _write(self, data: bytes) -> None:
+        if IS_WINDOWS:
+            if not (self.proc and self.proc.stdin):
+                raise BrokenPipeError("no stdin")
+            self.proc.stdin.write(data)
+            await self.proc.stdin.drain()
+            return
+        if self.master_fd is None:
+            raise BrokenPipeError("no master fd")
+        view = memoryview(data)
+        while view:
+            try:
+                n = os.write(self.master_fd, view)
+                view = view[n:]
+            except BlockingIOError:
+                await asyncio.sleep(0.005)
+            except InterruptedError:
+                continue
 
     async def _emit(self, data: str, stream: str = "stdout") -> None:
         cur = self.current
@@ -135,26 +220,30 @@ class PersistentShell:
                 "type": "output", "id": cur["id"], "stream": stream, "data": data,
             })
 
+    async def _stderr_pump(self) -> None:
+        if not (self.proc and getattr(self.proc, "stderr", None)):
+            return
+        while True:
+            try:
+                chunk = await self.proc.stderr.read(4096)
+            except Exception:
+                return
+            if not chunk:
+                return
+            if self.current:
+                await self._emit(chunk.decode("utf-8", errors="replace"), "stderr")
+
     async def _pump(self) -> None:
-        assert self.proc is not None
-
-        async def stderr_pump() -> None:
-            while True:
-                try:
-                    chunk = await self.proc.stderr.read(4096)
-                except Exception:
-                    return
-                if not chunk:
-                    return
-                if self.current:
-                    await self._emit(chunk.decode("utf-8", errors="replace"), "stderr")
-
-        stderr_task = asyncio.create_task(stderr_pump())
-
+        if IS_WINDOWS:
+            self.stderr_task = asyncio.create_task(self._stderr_pump())
+        assert self.reader is not None
         buf = ""
         try:
             while True:
-                chunk = await self.proc.stdout.read(4096)
+                try:
+                    chunk = await self.reader.read(4096)
+                except Exception:
+                    break
                 if not chunk:
                     break
                 buf += chunk.decode("utf-8", errors="replace")
@@ -166,7 +255,6 @@ class PersistentShell:
                 while self.current is not None:
                     marker = self.current["marker"]
                     idx = buf.find(marker)
-
                     if idx == -1:
                         keep = len(marker) - 1
                         if len(buf) > keep:
@@ -198,11 +286,22 @@ class PersistentShell:
                     cur["event"].set()
                     buf = rest[nl + 1:]
         finally:
-            stderr_task.cancel()
-            try:
-                await stderr_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            if self.stderr_task:
+                self.stderr_task.cancel()
+                try:
+                    await self.stderr_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self.stderr_task = None
+
+            cur = self.current
+            if cur is not None and not cur["event"].is_set():
+                cur["event"].set()
+                if cur.get("capture") is None:
+                    try:
+                        await self._send({"type": "exit", "id": cur["id"], "code": -1})
+                    except Exception:
+                        pass
 
     def _build_payload(self, cmd: str, marker: str) -> str:
         if IS_WINDOWS:
@@ -212,18 +311,14 @@ class PersistentShell:
 
     async def run(self, cmd_id: str, cmd: str) -> None:
         async with self.lock:
-            if self.proc is None or self.proc.returncode is not None:
+            if self._proc_dead():
                 await self.start()
-
             marker = f"__RELAY_DONE_{uuid.uuid4().hex}__"
             event = asyncio.Event()
             self.current = {"id": cmd_id, "marker": marker, "event": event}
-
             try:
-                assert self.proc and self.proc.stdin
-                self.proc.stdin.write(self._build_payload(cmd, marker).encode("utf-8"))
-                await self.proc.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
+                await self._write(self._build_payload(cmd, marker).encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 await self._send({
                     "type": "output", "id": cmd_id,
                     "stream": "stderr", "data": "shell died, restarting\n",
@@ -232,28 +327,22 @@ class PersistentShell:
                 self.proc = None
                 self.current = None
                 return
-
             await event.wait()
 
     async def capture(self, cmd: str) -> tuple[str, int]:
         async with self.lock:
-            if self.proc is None or self.proc.returncode is not None:
+            if self._proc_dead():
                 await self.start()
-
             marker = f"__RELAY_CAP_{uuid.uuid4().hex}__"
             event = asyncio.Event()
             buf: list[str] = []
-            cur_ref: dict = {"id": "__capture__", "marker": marker, "event": event, "capture": buf}
+            cur_ref = {"id": "__capture__", "marker": marker, "event": event, "capture": buf}
             self.current = cur_ref
-
             try:
-                assert self.proc and self.proc.stdin
-                self.proc.stdin.write(self._build_payload(cmd, marker).encode("utf-8"))
-                await self.proc.stdin.drain()
+                await self._write(self._build_payload(cmd, marker).encode("utf-8"))
             except Exception:
                 self.current = None
                 raise
-
             await event.wait()
             return "".join(buf), cur_ref.get("code", -1)
 
@@ -262,33 +351,78 @@ class PersistentShell:
         lines = [ln for ln in out.splitlines() if ln.strip()]
         return lines[-1].strip() if lines else os.getcwd()
 
-    async def stop(self) -> None:
-        if self.proc and self.proc.returncode is None:
-            try:
-                self.proc.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(self.proc.wait(), timeout=3)
-            except asyncio.TimeoutError:
+    async def interrupt(self, cmd_id: str) -> None:
+        cur = self.current
+        if cur is None:
+            return
+        if cmd_id and cur["id"] != cmd_id:
+            return
+        if IS_WINDOWS:
+            if self.proc and self.proc.returncode is None:
                 try:
-                    self.proc.kill()
-                except ProcessLookupError:
+                    self.proc.terminate()
+                except Exception:
                     pass
+            return
+        if self.master_fd is None:
+            return
+        try:
+            os.write(self.master_fd, b"\x03")
+        except OSError:
+            pass
+
+    async def stop(self) -> None:
+        if self.proc is not None:
+            if IS_WINDOWS:
+                if self.proc.returncode is None:
+                    try:
+                        self.proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(self.proc.wait(), timeout=3)
+                    except asyncio.TimeoutError:
+                        try:
+                            self.proc.kill()
+                        except Exception:
+                            pass
+            else:
+                if self.proc.poll() is None:
+                    try:
+                        self.proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        self.proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            self.proc.kill()
+                        except Exception:
+                            pass
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
         if self.pump_task:
             self.pump_task.cancel()
             try:
                 await self.pump_task
             except (asyncio.CancelledError, Exception):
                 pass
+            self.pump_task = None
 
 
 # ---------------------------------------------------------------- helpers
 
-async def _send_msg(ws, send_lock: asyncio.Lock, payload: dict) -> None:
+async def _send_msg(ws, send_lock: asyncio.Lock, payload: dict, sid: str | None = None) -> None:
+    p = dict(payload)
+    if sid:
+        p["sid"] = sid
     async with send_lock:
         try:
-            await ws.send(json.dumps(payload))
+            await ws.send(json.dumps(p))
         except Exception:
             pass
 
@@ -296,15 +430,17 @@ async def _send_msg(ws, send_lock: asyncio.Lock, payload: dict) -> None:
 # ---------------------------------------------------------------- fs handlers
 
 async def handle_fs_cwd(shell, ws, send_lock, m):
+    sid = m.get("sid")
     try:
         cwd = await shell.get_cwd()
-        await _send_msg(ws, send_lock, {"type": "fs_cwd_result", "id": m["id"], "cwd": cwd})
+        await _send_msg(ws, send_lock, {"type": "fs_cwd_result", "id": m["id"], "cwd": cwd}, sid)
     except Exception as e:
-        await _send_msg(ws, send_lock, {"type": "fs_cwd_result", "id": m["id"], "error": str(e)})
+        await _send_msg(ws, send_lock, {"type": "fs_cwd_result", "id": m["id"], "error": str(e)}, sid)
 
 
 async def handle_fs_list(ws, send_lock, m):
     path = m.get("path", "/")
+    sid = m.get("sid")
     try:
         entries = []
         with os.scandir(path) as it:
@@ -323,15 +459,16 @@ async def handle_fs_list(ws, send_lock, m):
         entries.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
         await _send_msg(ws, send_lock, {
             "type": "fs_list_result", "id": m["id"], "path": path, "entries": entries,
-        })
+        }, sid)
     except OSError as e:
         await _send_msg(ws, send_lock, {
             "type": "fs_list_result", "id": m["id"], "path": path, "error": str(e), "entries": [],
-        })
+        }, sid)
 
 
 async def handle_fs_get(ws, send_lock, m):
     path = m.get("path", "")
+    sid = m.get("sid")
     try:
         st = os.stat(path)
         if st.st_size > MAX_TRANSFER:
@@ -341,15 +478,16 @@ async def handle_fs_get(ws, send_lock, m):
         b64 = base64.b64encode(data).decode("ascii")
         await _send_msg(ws, send_lock, {
             "type": "fs_get_result", "id": m["id"], "path": path, "data": b64, "size": len(data),
-        })
+        }, sid)
     except OSError as e:
         await _send_msg(ws, send_lock, {
             "type": "fs_get_result", "id": m["id"], "path": path, "error": str(e),
-        })
+        }, sid)
 
 
 async def handle_fs_put(ws, send_lock, m):
     path = m.get("path", "")
+    sid = m.get("sid")
     try:
         data = base64.b64decode(m.get("data", ""))
         if len(data) > MAX_TRANSFER:
@@ -361,11 +499,11 @@ async def handle_fs_put(ws, send_lock, m):
             f.write(data)
         await _send_msg(ws, send_lock, {
             "type": "fs_put_result", "id": m["id"], "path": path, "ok": True, "size": len(data),
-        })
+        }, sid)
     except Exception as e:
         await _send_msg(ws, send_lock, {
             "type": "fs_put_result", "id": m["id"], "path": path, "ok": False, "error": str(e),
-        })
+        }, sid)
 
 
 # ---------------------------------------------------------------- tunnel handlers
@@ -375,7 +513,6 @@ DROP_FOR_WS_UPSTREAM = {
     "host", "connection", "upgrade",
     "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
 }
-
 HOP_BY_HOP_LOCAL = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade",
@@ -400,10 +537,7 @@ async def _do_http_tunnel(ws, send_lock, m):
     if query:
         url += "?" + query
 
-    headers = {
-        k: v for k, v in (m.get("headers") or {}).items()
-        if k.lower() not in DROP_FOR_UPSTREAM
-    }
+    headers = {k: v for k, v in (m.get("headers") or {}).items() if k.lower() not in DROP_FOR_UPSTREAM}
     body = base64.b64decode(m["body_b64"]) if m.get("body_b64") else None
 
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
@@ -413,22 +547,16 @@ async def _do_http_tunnel(ws, send_lock, m):
                 m["method"], url, headers=headers, data=body,
                 allow_redirects=False, auto_decompress=False,
             ) as resp:
-                resp_headers = {
-                    k: v for k, v in resp.headers.items()
-                    if k.lower() not in HOP_BY_HOP_LOCAL
-                }
+                resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP_LOCAL}
                 await _send_msg(ws, send_lock, {
-                    "type": "tunnel_response",
-                    "id": tid,
-                    "status": resp.status,
-                    "headers": resp_headers,
+                    "type": "tunnel_response", "id": tid,
+                    "status": resp.status, "headers": resp_headers,
                 })
                 async for chunk in resp.content.iter_chunked(16384):
                     if not chunk:
                         continue
                     await _send_msg(ws, send_lock, {
-                        "type": "tunnel_data",
-                        "id": tid,
+                        "type": "tunnel_data", "id": tid,
                         "data_b64": base64.b64encode(chunk).decode(),
                     })
         await _send_msg(ws, send_lock, {"type": "tunnel_end", "id": tid})
@@ -448,10 +576,7 @@ async def _do_ws_tunnel(ws, send_lock, m, active_tunnels: dict):
     if query:
         url += "?" + query
 
-    headers = {
-        k: v for k, v in (m.get("headers") or {}).items()
-        if k.lower() not in DROP_FOR_WS_UPSTREAM
-    }
+    headers = {k: v for k, v in (m.get("headers") or {}).items() if k.lower() not in DROP_FOR_WS_UPSTREAM}
 
     q: asyncio.Queue = asyncio.Queue()
     active_tunnels[tid] = q
@@ -489,8 +614,7 @@ async def _do_ws_tunnel(ws, send_lock, m, active_tunnels: dict):
                         else:
                             await _send_msg(ws, send_lock, {
                                 "type": "tunnel_ws_data", "id": tid,
-                                "data": base64.b64encode(msg).decode(),
-                                "is_text": False,
+                                "data": base64.b64encode(msg).decode(), "is_text": False,
                             })
                 except websockets.ConnectionClosed:
                     pass
@@ -521,14 +645,19 @@ async def session(url: str) -> None:
             await ws.send(json.dumps({
                 "type": "hello",
                 "host": socket.gethostname(),
-                "cwd": os.getcwd(),
                 "shell": "cmd" if IS_WINDOWS else "bash",
             }))
 
-        shell = PersistentShell(ws, send_lock)
-        await shell.start()
-
+        shells: dict[str, PersistentShell] = {}
         active_tunnels: dict[str, asyncio.Queue] = {}
+
+        async def get_shell(sid: str) -> PersistentShell:
+            shell = shells.get(sid)
+            if shell is None:
+                shell = PersistentShell(ws, send_lock, sid)
+                shells[sid] = shell
+                await shell.start()
+            return shell
 
         try:
             async for raw in ws:
@@ -537,11 +666,40 @@ async def session(url: str) -> None:
                 except json.JSONDecodeError:
                     continue
                 t = m.get("type")
+                sid = m.get("sid")
 
-                if t == "command":
-                    log(f"exec: {m.get('cmd','')}")
+                if t == "tunnel_open":
+                    log(f"tunnel: {m.get('kind')} :{m.get('port')}{m.get('path','')}")
+                    asyncio.create_task(handle_tunnel_open(ws, send_lock, m, active_tunnels))
+                elif t in ("tunnel_ws_data", "tunnel_close"):
+                    q = active_tunnels.get(m.get("id"))
+                    if q:
+                        await q.put(m)
+                elif t == "session_open":
+                    if sid and sid not in shells:
+                        log(f"session open: {sid}")
+                        await get_shell(sid)
+                elif t == "session_close":
+                    shell = shells.pop(sid, None)
+                    if shell:
+                        log(f"session close: {sid}")
+                        await shell.stop()
+                elif t == "command":
+                    if not sid:
+                        continue
+                    shell = await get_shell(sid)
+                    log(f"exec[{sid[:8]}]: {m.get('cmd','')}")
                     asyncio.create_task(shell.run(m["id"], m.get("cmd") or ""))
+                elif t == "command_interrupt":
+                    if not sid:
+                        continue
+                    shell = shells.get(sid)
+                    if shell:
+                        asyncio.create_task(shell.interrupt(m.get("id") or ""))
                 elif t == "fs_cwd":
+                    if not sid:
+                        continue
+                    shell = await get_shell(sid)
                     asyncio.create_task(handle_fs_cwd(shell, ws, send_lock, m))
                 elif t == "fs_list":
                     asyncio.create_task(handle_fs_list(ws, send_lock, m))
@@ -549,17 +707,12 @@ async def session(url: str) -> None:
                     asyncio.create_task(handle_fs_get(ws, send_lock, m))
                 elif t == "fs_put":
                     asyncio.create_task(handle_fs_put(ws, send_lock, m))
-                elif t == "tunnel_open":
-                    log(f"tunnel: {m.get('kind')} :{m.get('port')}{m.get('path','')}")
-                    asyncio.create_task(handle_tunnel_open(ws, send_lock, m, active_tunnels))
-                elif t in ("tunnel_ws_data", "tunnel_close"):
-                    q = active_tunnels.get(m.get("id"))
-                    if q:
-                        await q.put(m)
         finally:
             for q in active_tunnels.values():
                 await q.put({"type": "tunnel_close"})
-            await shell.stop()
+            for shell in list(shells.values()):
+                await shell.stop()
+            shells.clear()
 
 
 # ---------------------------------------------------------------- main

@@ -34,6 +34,7 @@
     </div>
 
     <div class="ml-auto flex items-center gap-2">
+      <span class="text-[10px] text-neutral-600 font-mono" :title="sid" x-text="'sid ' + (sid ? sid.slice(0,8) : '…')"></span>
       <button @click="openPort()"
               class="rounded-md border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200">
         open port
@@ -115,9 +116,12 @@
         </template>
         <template x-if="b.kind === 'cmd'">
           <div>
-            <div class="flex gap-2">
-              <span class="select-none text-emerald-400">$</span>
-              <span class="whitespace-pre-wrap break-all text-neutral-100" x-text="b.cmd"></span>
+            <div class="flex items-start gap-2">
+              <span class="select-none pt-0.5 text-emerald-400">$</span>
+              <span class="flex-1 whitespace-pre-wrap break-all text-neutral-100" x-text="b.cmd"></span>
+              <button x-show="b.running" @click="interrupt(b)"
+                      class="shrink-0 rounded border border-red-900/60 px-1.5 py-0.5 text-[10px] text-red-400 hover:bg-red-950/40"
+                      title="Send Ctrl+C">stop</button>
             </div>
             <pre x-show="b.out" class="whitespace-pre-wrap break-all text-neutral-300" x-text="b.out"></pre>
             <pre x-show="b.err" class="whitespace-pre-wrap break-all text-red-400" x-text="b.err"></pre>
@@ -163,18 +167,28 @@ function consoleApp() {
     histIdx: 0,
     uid: 0,
     reconnectDelay: 500,
+    sid: '',
 
     rpcWaiters: [],
     uploadTarget: '',
-    panel: {
-      open: false,
-      root: null,
-    },
+    panel: { open: false, root: null },
 
     init() {
+      this.sid = this.loadSid();
       this.connect();
       this.$nextTick(() => { this.focus(); this.autosize(); });
       this.$watch('input', () => this.autosize());
+    },
+
+    loadSid() {
+      let sid = sessionStorage.getItem('ws-relay-sid');
+      if (!sid) {
+        sid = crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        sessionStorage.setItem('ws-relay-sid', sid);
+      }
+      return sid;
     },
 
     focus() { if (this.$refs.input) this.$refs.input.focus(); },
@@ -196,13 +210,14 @@ function consoleApp() {
 
     connect() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${location.host}/ws?role=ui`);
+      const url = `${proto}//${location.host}/ws?role=ui&sid=${encodeURIComponent(this.sid)}`;
+      const ws = new WebSocket(url);
       this.ws = ws;
 
       ws.onopen = () => {
         this.uiConnected = true;
         this.reconnectDelay = 500;
-        this.sys('connected to host');
+        this.sys(`connected (session ${this.sid.slice(0,8)})`);
       };
 
       ws.onmessage = (ev) => {
@@ -234,6 +249,13 @@ function consoleApp() {
       }
 
       switch (m.type) {
+        case 'sid':
+          // server may assign a different sid if query was missing
+          if (m.sid && m.sid !== this.sid) {
+            this.sid = m.sid;
+            sessionStorage.setItem('ws-relay-sid', m.sid);
+          }
+          break;
         case 'status':
           this.agentOnline = m.agent === 'connected';
           if (!this.agentOnline) { this.agentInfo = ''; this.panel.root = null; }
@@ -255,6 +277,7 @@ function consoleApp() {
           if (!b) break;
           b.exit = m.code;
           b.done = true;
+          b.running = false;
           this.scrollDown();
           break;
         }
@@ -299,7 +322,7 @@ function consoleApp() {
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-      this.blocks.push({ uid: ++this.uid, kind: 'cmd', id, cmd, out: '', err: '', exit: null, done: false });
+      this.blocks.push({ uid: ++this.uid, kind: 'cmd', id, cmd, out: '', err: '', exit: null, done: false, running: true });
       this.ws.send(JSON.stringify({ type: 'command', id, cmd }));
 
       if (this.history[this.history.length - 1] !== cmd) this.history.push(cmd);
@@ -307,6 +330,11 @@ function consoleApp() {
       this.input = '';
       this.autosize();
       this.scrollDown();
+    },
+
+    interrupt(b) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      this.ws.send(JSON.stringify({ type: 'command_interrupt', id: b.id }));
     },
 
     hist(dir) {
@@ -352,12 +380,8 @@ function consoleApp() {
         return;
       }
       this.panel.root = {
-        name: res.cwd,
-        path: res.cwd,
-        type: 'dir',
-        children: null,
-        expanded: true,
-        loading: false,
+        name: res.cwd, path: res.cwd, type: 'dir',
+        children: null, expanded: true, loading: false,
       };
       await this.loadDir(this.panel.root);
     },
@@ -384,8 +408,7 @@ function consoleApp() {
 
     async refreshPath(path) {
       const node = this.findNodeByPath(path);
-      if (!node) return;
-      if (node.children === null) return;
+      if (!node || node.children === null) return;
       await this.loadDir(node);
     },
 
