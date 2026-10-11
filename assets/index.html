@@ -15,7 +15,7 @@
 </style>
 </head>
 <body class="h-full bg-neutral-950 text-neutral-200 antialiased">
-<div x-data="consoleApp()" class="flex h-full flex-col" @keydown.escape.window="panel.open = false">
+<div x-data="consoleApp()" class="relative flex h-full flex-col" @keydown.escape.window="panel.open = false">
 
   <header class="flex items-center gap-4 border-b border-neutral-800 bg-neutral-900/60 px-4 py-2.5">
     <button @click="togglePanel()"
@@ -109,7 +109,8 @@
 
   <input x-ref="fileInput" type="file" multiple class="hidden" @change="onFileSelected($event)" />
 
-  <main x-ref="out" class="flex-1 overflow-y-auto px-4 py-3 font-mono text-[13px] leading-relaxed">
+  <main x-ref="out" @scroll="onScroll($event)"
+        class="flex-1 overflow-y-auto px-4 py-3 font-mono text-[13px] leading-relaxed">
     <template x-for="b in blocks" :key="b.uid">
       <div class="mb-3">
         <template x-if="b.kind === 'sys'">
@@ -134,6 +135,12 @@
     </template>
     <div x-show="blocks.length === 0" class="text-neutral-600">type a command below…</div>
   </main>
+
+  <button x-show="!stickBottom" x-cloak @click="jumpToBottom()"
+          class="absolute right-6 z-20 rounded-full border border-neutral-700 bg-neutral-800/90 px-3 py-1.5 text-xs text-neutral-200 shadow-lg backdrop-blur hover:bg-neutral-700"
+          style="bottom: 6.5rem;">
+    ↓ jump to bottom
+  </button>
 
   <footer class="border-t border-neutral-800 bg-neutral-900/60 px-4 py-3">
     <div class="flex items-start gap-2 font-mono text-[13px]">
@@ -169,6 +176,7 @@ function consoleApp() {
     uid: 0,
     reconnectDelay: 500,
     sid: '',
+    stickBottom: true,
 
     rpcWaiters: [],
     uploadTarget: '',
@@ -209,6 +217,19 @@ function consoleApp() {
       this.send();
     },
 
+    onScroll(e) {
+      const el = e.target;
+      this.stickBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 40;
+    },
+
+    jumpToBottom() {
+      this.stickBottom = true;
+      this.$nextTick(() => {
+        const el = this.$refs.out;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    },
+
     connect() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const url = `${proto}//${location.host}/ws?role=ui&sid=${encodeURIComponent(this.sid)}`;
@@ -241,7 +262,6 @@ function consoleApp() {
     },
 
     handle(m) {
-      // Drop anything tagged for a different tab.
       if (m.sid && m.sid !== this.sid) return;
 
       for (const h of this.rpcWaiters.slice()) {
@@ -330,6 +350,7 @@ function consoleApp() {
       this.histIdx = this.history.length;
       this.input = '';
       this.autosize();
+      this.stickBottom = true;
       this.scrollDown();
     },
 
@@ -362,13 +383,13 @@ function consoleApp() {
     },
 
     scrollDown() {
+      if (!this.stickBottom) return;
       this.$nextTick(() => {
         const el = this.$refs.out;
         if (el) el.scrollTop = el.scrollHeight;
       });
     },
 
-    // ---------- file panel ----------
     togglePanel() {
       this.panel.open = !this.panel.open;
       if (this.panel.open) this.reloadToCwd();

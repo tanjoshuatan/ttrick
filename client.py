@@ -136,8 +136,9 @@ class PersistentShell:
         master, slave = pty.openpty()
         try:
             attrs = termios.tcgetattr(slave)
-            attrs[3] &= ~(termios.ECHO | termios.ECHONL)
-            attrs[1] &= ~termios.ONLCR
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL)   # lflag: no echo
+            attrs[3] |= termios.NOFLSH                     # lflag: don't flush input on SIGINT
+            attrs[1] &= ~termios.ONLCR                     # oflag: no \n → \r\n
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         except Exception as e:
