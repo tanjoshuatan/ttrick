@@ -245,7 +245,11 @@ class PersistentShell:
                     marker = self.current["marker"]
                     idx = buf.find(marker)
                     if idx == -1:
-                        keep = len(marker) - 1
+                        keep = 0
+                        for k in range(min(len(buf), len(marker)), 0, -1):
+                            if buf[-k:] == marker[:k]:
+                                keep = k
+                                break
                         if len(buf) > keep:
                             out, buf = buf[:len(buf) - keep], buf[len(buf) - keep:]
                             if out:
