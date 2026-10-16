@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>WS Command Console</title>
+<title>COMPUTE Terminal</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
 <style>
@@ -500,7 +500,7 @@ function consoleApp() {
       this.$refs.fileInput.click();
     },
 
-    async onFileSelected(e) {
+        async onFileSelected(e) {
       const files = Array.from(e.target.files || []);
       if (!files.length) return;
       const dir = this.uploadTarget.replace(/[\\/]+$/, '');
@@ -508,12 +508,9 @@ function consoleApp() {
         try {
           const buf = await f.arrayBuffer();
           const b64 = this.bufToB64(buf);
-          const sep = (dir.endsWith('/') || dir.endsWith('\\'))
-            ? ''
-            : (navigator.userAgent.includes('Win') ? '\\' : '/');
-          const path = dir + sep + f.name;
+          const path = dir + '/' + f.name;
           this.sys(`uploading ${f.name} (${this.fmtSize(f.size)}) → ${path}…`);
-          const res = await this.rpc('fs_put', { path, data: b64 }, 120000);
+          const res = await this.rpc('fs_put', { path, data: b64 }, 300000);
           if (res.ok) {
             this.sys(`uploaded ${f.name} (${this.fmtSize(res.size)})`);
             await this.refreshPath(this.uploadTarget);

@@ -7,6 +7,8 @@ import logging
 import time
 import uuid
 from pathlib import Path
+from dotenv import load_dotenv
+import os
 
 from aiohttp import WSMsgType, web
 
@@ -389,8 +391,11 @@ def main() -> None:
     }))
     app.router.add_get("/t/{port}", handle_tunnel_root)
     app.router.add_route("*", "/t/{port}/{path:.*}", handle_tunnel)
-    log.info("host listening on http://0.0.0.0:8081")
-    web.run_app(app, host="0.0.0.0", port=8081, print=None)
+
+    load_dotenv()
+
+    log.info(f"Terminal is available on { (int(os.environ.get('PORT'))) }")
+    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT")), print=None)
 
 
 if __name__ == "__main__":

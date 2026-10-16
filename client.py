@@ -8,6 +8,7 @@ import os
 import platform
 import socket
 import subprocess
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -26,7 +27,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_HOST_FILE = HERE / "host.txt"
 HOST_FILE: Path = DEFAULT_HOST_FILE
 
-RETRY_DELAY = 1.0
+RETRY_DELAY = 10.0
 HEARTBEAT_INTERVAL = 20.0
 MAX_TRANSFER = 32 * 1024 * 1024
 
@@ -39,25 +40,47 @@ def log(msg: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="client.py")
-    p.add_argument("host_file", nargs="?", default=str(DEFAULT_HOST_FILE))
+    p.add_argument(
+        "host_file",
+        nargs="?",
+        default=str(DEFAULT_HOST_FILE),
+        help=f"file containing the KV store base URL (default: {DEFAULT_HOST_FILE})",
+    )
+    p.add_argument(
+        "-u", "--username",
+        required=True,
+        help="username to look up in the KV store",
+    )
     return p.parse_args()
 
 
 def read_host_url() -> str | None:
+    """Read the KV store base URL (first non-empty, non-comment line)."""
     try:
         text = HOST_FILE.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        log(f"{HOST_FILE.name} not found")
-        return None
-    except OSError as e:
-        log(f"cannot read {HOST_FILE.name}: {e}")
+    except (FileNotFoundError, OSError):
         return None
     for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             return line
-    log(f"{HOST_FILE.name} is empty")
     return None
+
+
+async def resolve_target(kv_base: str, username: str) -> str | None:
+    """Query the KV store for the actual host URL. Returns plaintext or None."""
+    base = kv_base.rstrip("/")
+    url = f"{base}/?username={urllib.parse.quote(username)}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                text = (await resp.text()).strip()
+                return text or None
+    except Exception:
+        return None
 
 
 def to_ws_url(base: str) -> str:
@@ -136,9 +159,9 @@ class PersistentShell:
         master, slave = pty.openpty()
         try:
             attrs = termios.tcgetattr(slave)
-            attrs[3] &= ~(termios.ECHO | termios.ECHONL)   # lflag: no echo
-            attrs[3] |= termios.NOFLSH                     # lflag: don't flush input on SIGINT
-            attrs[1] &= ~termios.ONLCR                     # oflag: no \n → \r\n
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL)
+            attrs[3] |= termios.NOFLSH
+            attrs[1] &= ~termios.ONLCR
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         except Exception as e:
@@ -149,7 +172,7 @@ class PersistentShell:
         env["PS1"] = ""
         env["PS2"] = ""
         env["PROMPT_COMMAND"] = ""
-        env["PYTHONUNBUFFERED"] = "1"       # <-- add this
+        env["PYTHONUNBUFFERED"] = "1"
 
         def _child_setup():
             os.setsid()
@@ -622,89 +645,95 @@ async def _do_ws_tunnel(ws, send_lock, m, active_tunnels):
 # ---------------------------------------------------------------- session
 
 async def session(url: str) -> None:
-    async with websockets.connect(
-        url,
-        ping_interval=None,
-        ping_timeout=None,
-        max_size=None,
-        additional_headers={"ngrok-skip-browser-warning": "true"},
-    ) as ws:
-        log(f"connected to {url}")
+    connected = False
+    try:
+        async with websockets.connect(
+            url,
+            ping_interval=None,
+            ping_timeout=None,
+            max_size=None,
+            additional_headers={"ngrok-skip-browser-warning": "true"},
+        ) as ws:
+            connected = True
+            log(f"connected to {url}")
 
-        send_lock = asyncio.Lock()
-        async with send_lock:
-            await ws.send(json.dumps({
-                "type": "hello",
-                "host": socket.gethostname(),
-                "cwd": os.getcwd(),
-            }))
+            send_lock = asyncio.Lock()
+            async with send_lock:
+                await ws.send(json.dumps({
+                    "type": "hello",
+                    "host": socket.gethostname(),
+                    "cwd": os.getcwd(),
+                }))
 
-        hb = asyncio.create_task(_heartbeat_loop(ws, send_lock))
+            hb = asyncio.create_task(_heartbeat_loop(ws, send_lock))
 
-        shells: dict[str, PersistentShell] = {}
-        active_tunnels: dict[str, asyncio.Queue] = {}
+            shells: dict[str, PersistentShell] = {}
+            active_tunnels: dict[str, asyncio.Queue] = {}
 
-        async def get_shell(sid):
-            shell = shells.get(sid)
-            if shell is None:
-                shell = PersistentShell(ws, send_lock, sid)
-                shells[sid] = shell
-                log(f"shell open: {sid[:8]}")
-                await shell.start()
-            return shell
+            async def get_shell(sid):
+                shell = shells.get(sid)
+                if shell is None:
+                    shell = PersistentShell(ws, send_lock, sid)
+                    shells[sid] = shell
+                    log(f"shell open: {sid[:8]}")
+                    await shell.start()
+                return shell
 
-        try:
-            async for raw in ws:
-                try:
-                    m = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                t = m.get("type")
-                sid = m.get("sid")
-
-                if t == "pong":
-                    continue
-                if t == "tunnel_open":
-                    log(f"tunnel: {m.get('kind')} :{m.get('port')}{m.get('path','')}")
-                    asyncio.create_task(handle_tunnel_open(ws, send_lock, m, active_tunnels))
-                elif t in ("tunnel_ws_data", "tunnel_close"):
-                    q = active_tunnels.get(m.get("id"))
-                    if q:
-                        await q.put(m)
-                elif t == "command":
-                    if not sid:
-                        continue
-                    shell = await get_shell(sid)
-                    log(f"exec[{sid[:8]}]: {m.get('cmd','')}")
-                    asyncio.create_task(shell.run(m["id"], m.get("cmd") or ""))
-                elif t == "command_interrupt":
-                    if not sid:
-                        continue
-                    shell = shells.get(sid)
-                    if shell:
-                        asyncio.create_task(shell.interrupt(m.get("id") or ""))
-                elif t == "fs_cwd":
-                    if not sid:
-                        continue
-                    shell = await get_shell(sid)
-                    asyncio.create_task(handle_fs_cwd(shell, ws, send_lock, m))
-                elif t == "fs_list":
-                    asyncio.create_task(handle_fs_list(ws, send_lock, m))
-                elif t == "fs_get":
-                    asyncio.create_task(handle_fs_get(ws, send_lock, m))
-                elif t == "fs_put":
-                    asyncio.create_task(handle_fs_put(ws, send_lock, m))
-        finally:
-            hb.cancel()
             try:
-                await hb
-            except (asyncio.CancelledError, Exception):
-                pass
-            for q in active_tunnels.values():
-                await q.put({"type": "tunnel_close"})
-            for shell in list(shells.values()):
-                await shell.stop()
-            shells.clear()
+                async for raw in ws:
+                    try:
+                        m = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    t = m.get("type")
+                    sid = m.get("sid")
+
+                    if t == "pong":
+                        continue
+                    if t == "tunnel_open":
+                        log(f"tunnel: {m.get('kind')} :{m.get('port')}{m.get('path','')}")
+                        asyncio.create_task(handle_tunnel_open(ws, send_lock, m, active_tunnels))
+                    elif t in ("tunnel_ws_data", "tunnel_close"):
+                        q = active_tunnels.get(m.get("id"))
+                        if q:
+                            await q.put(m)
+                    elif t == "command":
+                        if not sid:
+                            continue
+                        shell = await get_shell(sid)
+                        log(f"exec[{sid[:8]}]: {m.get('cmd','')}")
+                        asyncio.create_task(shell.run(m["id"], m.get("cmd") or ""))
+                    elif t == "command_interrupt":
+                        if not sid:
+                            continue
+                        shell = shells.get(sid)
+                        if shell:
+                            asyncio.create_task(shell.interrupt(m.get("id") or ""))
+                    elif t == "fs_cwd":
+                        if not sid:
+                            continue
+                        shell = await get_shell(sid)
+                        asyncio.create_task(handle_fs_cwd(shell, ws, send_lock, m))
+                    elif t == "fs_list":
+                        asyncio.create_task(handle_fs_list(ws, send_lock, m))
+                    elif t == "fs_get":
+                        asyncio.create_task(handle_fs_get(ws, send_lock, m))
+                    elif t == "fs_put":
+                        asyncio.create_task(handle_fs_put(ws, send_lock, m))
+            finally:
+                hb.cancel()
+                try:
+                    await hb
+                except (asyncio.CancelledError, Exception):
+                    pass
+                for q in active_tunnels.values():
+                    await q.put({"type": "tunnel_close"})
+                for shell in list(shells.values()):
+                    await shell.stop()
+                shells.clear()
+    finally:
+        if connected:
+            log("Disconnecting... Attempt to reconnect?")
 
 
 # ---------------------------------------------------------------- main
@@ -713,28 +742,31 @@ async def main() -> None:
     global HOST_FILE
     args = parse_args()
     HOST_FILE = Path(args.host_file).expanduser().resolve()
+    username = args.username
 
     if not HOST_FILE.exists():
         log(f"warning: {HOST_FILE} does not exist yet — will keep retrying")
 
     while True:
-        url = read_host_url()
-        if url is None:
+        kv_base = read_host_url()
+        if kv_base is None:
             await asyncio.sleep(RETRY_DELAY)
             continue
 
-        ws_url = to_ws_url(url)
+        target = await resolve_target(kv_base, username)
+        if target is None:
+            await asyncio.sleep(RETRY_DELAY)
+            continue
+
+        ws_url = to_ws_url(target)
+
         try:
             await session(ws_url)
-            log("connection closed")
         except asyncio.CancelledError:
             raise
-        except websockets.ConnectionClosed as e:
-            log(f"closed: code={e.code} reason={e.reason!r}")
-        except Exception as e:
-            log(f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
 
-        log(f"reconnecting in {RETRY_DELAY:.1f}s")
         await asyncio.sleep(RETRY_DELAY)
 
 
