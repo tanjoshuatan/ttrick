@@ -171,34 +171,39 @@ class PersistentShell:
 
     async def _start_posix(self):
         master, slave = pty.openpty()
+        
+        # Set master to non-blocking
+        flags = fcntl.fcntl(master, fcntl.F_GETFL)
+        fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        
         try:
             attrs = termios.tcgetattr(slave)
-            attrs[3] &= ~(termios.ECHO | termios.ECHONL)   # lflag: no echo
-            attrs[3] |= termios.NOFLSH                     # lflag: don't flush input on SIGINT
-            attrs[1] &= ~termios.ONLCR                     # oflag: no \n → \r\n
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL)
+            attrs[3] |= termios.NOFLSH
+            attrs[1] &= ~termios.ONLCR
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         except Exception as e:
             log(f"pty termios warning: {e}")
 
         env = os.environ.copy()
-        env["TERM"] = "dumb"
+        env["TERM"] = "xterm"  # Changed from "dumb" just in case
         env["PS1"] = ""
         env["PS2"] = ""
         env["PROMPT_COMMAND"] = ""
         env["PYTHONUNBUFFERED"] = "1"
         
-        # Inject the user variables
+        # Explicitly set user variables
         env["USER"] = self.username
         env["LOGNAME"] = self.username
         env["USERNAME"] = self.username
         env["HOME"] = f"/project/fyp26_lz1/{self.username}"
 
-        # CRITICAL: Create $HOME if it doesn't exist, so `bash -i` doesn't crash
+        # CRITICAL: Create the HOME folder right now so bash doesn't crash
         try:
             os.makedirs(env["HOME"], exist_ok=True)
         except OSError as e:
-            log(f"Failed to create HOME directory: {e}")
+            log(f"FAILED to create HOME: {e}")
 
         def _child_setup():
             os.setsid()
@@ -207,25 +212,34 @@ class PersistentShell:
             except OSError:
                 pass
 
-        # Use custom .bashrc
         rc_file = HERE / ".bashrc"
-        cmd = ["/bin/bash", "--noediting", "-i"]
-        if rc_file.exists():
-            cmd.extend(["--rcfile", str(rc_file)])
+        cmd = ["/bin/bash", "--noediting", "--rcfile", str(rc_file), "-i"]
 
+        # CRITICAL: Capture stderr so we can see bash's crash message!
         self.proc = subprocess.Popen(
             cmd,
-            stdin=slave, stdout=slave, stderr=slave,
+            stdin=slave, stdout=slave, stderr=subprocess.PIPE,
             env=env, preexec_fn=_child_setup, close_fds=True,
         )
         os.close(slave)
         self.master_fd = os.dup(master)
 
+        # Background task to read bash's errors
+        async def read_stderr():
+            while True:
+                try:
+                    chunk = await self.proc.stderr.read(1024)
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                log(f"BASH CRASH: {chunk.decode('utf-8', errors='replace').strip()}")
+
+        asyncio.create_task(read_stderr())
+
         loop = asyncio.get_event_loop()
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
-        
-        # CRITICAL: Store the transport to prevent it from being garbage collected
         self.transport, _ = await loop.connect_read_pipe(lambda: protocol, _PipeEndpoint(master))
         self.reader = reader
 
