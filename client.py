@@ -206,9 +206,10 @@ class PersistentShell:
             except OSError: pass
 
         rc_file = HERE / ".bashrc"
-        cmd = ["/bin/bash", "--noediting", "-i"]
+        cmd = ["/bin/bash", "--noediting"]
         if rc_file.exists():
             cmd.extend(["--rcfile", str(rc_file)])
+        cmd.append("-i")
             
         log(f"[{self.sid[:8]}] calling Popen: {cmd}")
         
@@ -233,7 +234,8 @@ class PersistentShell:
     async def _prime(self):
         marker = f"__RELAY_PRIME_{uuid.uuid4().hex}__"
         event = asyncio.Event()
-        self.current = {"id": "__prime__", "marker": marker, "event": event, "capture": []}
+        # REMOVED capture: [] so it prints to the UI
+        self.current = {"id": "__prime__", "marker": marker, "event": event}
         
         if IS_WINDOWS:
             payload = f"echo {marker}\r\n"
