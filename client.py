@@ -55,7 +55,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_host_url() -> str | None:
-    """Read the KV store base URL (first non-empty, non-comment line)."""
     try:
         text = HOST_FILE.read_text(encoding="utf-8")
     except (FileNotFoundError, OSError):
@@ -68,7 +67,6 @@ def read_host_url() -> str | None:
 
 
 async def resolve_target(kv_base: str, username: str) -> str | None:
-    """Query the KV store for the actual host URL. Returns plaintext or None."""
     base = kv_base.rstrip("/")
     url = f"{base}/?username={urllib.parse.quote(username)}"
     try:
@@ -111,10 +109,11 @@ if not IS_WINDOWS:
 class PersistentShell:
     """One bash per session (sid), persistent, with pty so Ctrl+C works."""
 
-    def __init__(self, ws, send_lock, sid):
+    def __init__(self, ws, send_lock, sid, username):
         self.ws = ws
         self.send_lock = send_lock
         self.sid = sid
+        self.username = username
         self.proc = None
         self.master_fd = None
         self.reader = None
@@ -159,9 +158,9 @@ class PersistentShell:
         master, slave = pty.openpty()
         try:
             attrs = termios.tcgetattr(slave)
-            attrs[3] &= ~(termios.ECHO | termios.ECHONL)
-            attrs[3] |= termios.NOFLSH
-            attrs[1] &= ~termios.ONLCR
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL)   # lflag: no echo
+            attrs[3] |= termios.NOFLSH                     # lflag: don't flush input on SIGINT
+            attrs[1] &= ~termios.ONLCR                     # oflag: no \n → \r\n
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         except Exception as e:
@@ -173,6 +172,10 @@ class PersistentShell:
         env["PS2"] = ""
         env["PROMPT_COMMAND"] = ""
         env["PYTHONUNBUFFERED"] = "1"
+        
+        # Inject username and ensure HOME points to the user's specific folder
+        env["USERNAME"] = self.username
+        env["HOME"] = f"/project/fyp26_lz1/{self.username}"
 
         def _child_setup():
             os.setsid()
@@ -181,8 +184,15 @@ class PersistentShell:
             except OSError:
                 pass
 
+        # Use our custom .bashrc
+        rc_file = HERE / ".bashrc"
+        
+        cmd = ["/bin/bash", "--noediting", "-i"]
+        if rc_file.exists():
+            cmd.extend(["--rcfile", str(rc_file)])
+
         self.proc = subprocess.Popen(
-            ["/bin/bash", "--norc", "--noprofile", "--noediting", "-i"],
+            cmd,
             stdin=slave, stdout=slave, stderr=slave,
             env=env, preexec_fn=_child_setup, close_fds=True,
         )
@@ -197,9 +207,17 @@ class PersistentShell:
 
     async def _prime(self):
         marker = f"__RELAY_PRIME_{uuid.uuid4().hex}__"
-        payload = f"echo {marker}\r\n" if IS_WINDOWS else f"printf '{marker}\\n'\n"
         event = asyncio.Event()
         self.current = {"id": "__prime__", "marker": marker, "event": event, "capture": []}
+        
+        # Inject the cd command before printing the marker
+        if IS_WINDOWS:
+            cd_cmd = f"cd /d \\project\\fyp26_lz1\\{self.username}\n"
+            payload = f"{cd_cmd}echo {marker}\r\n"
+        else:
+            cd_cmd = f"cd /project/fyp26_lz1/{self.username}\n"
+            payload = f"{cd_cmd}printf '{marker}\\n'\n"
+            
         await self._write(payload.encode())
         await event.wait()
 
@@ -644,7 +662,7 @@ async def _do_ws_tunnel(ws, send_lock, m, active_tunnels):
 
 # ---------------------------------------------------------------- session
 
-async def session(url: str) -> None:
+async def session(url: str, username: str) -> None:
     connected = False
     try:
         async with websockets.connect(
@@ -673,7 +691,7 @@ async def session(url: str) -> None:
             async def get_shell(sid):
                 shell = shells.get(sid)
                 if shell is None:
-                    shell = PersistentShell(ws, send_lock, sid)
+                    shell = PersistentShell(ws, send_lock, sid, username)
                     shells[sid] = shell
                     log(f"shell open: {sid[:8]}")
                     await shell.start()
@@ -761,7 +779,7 @@ async def main() -> None:
         ws_url = to_ws_url(target)
 
         try:
-            await session(ws_url)
+            await session(ws_url, username)
         except asyncio.CancelledError:
             raise
         except Exception:
