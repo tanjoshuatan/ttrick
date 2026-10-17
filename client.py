@@ -117,6 +117,7 @@ class PersistentShell:
         self.proc = None
         self.master_fd = None
         self.reader = None
+        self.transport = None  # <-- Keep reference to prevent GC
         self.pump_task = None
         self.stderr_task = None
         self.lock = asyncio.Lock()
@@ -138,10 +139,24 @@ class PersistentShell:
         return self.proc.poll() is not None
 
     async def start(self):
+        # Clean up any previous transport/tasks
+        if self.pump_task:
+            self.pump_task.cancel()
+            try:
+                await self.pump_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self.pump_task = None
+            
+        if self.transport:
+            self.transport.close()
+            self.transport = None
+
         if IS_WINDOWS:
             await self._start_windows()
         else:
             await self._start_posix()
+            
         self.pump_task = asyncio.create_task(self._pump())
         await self._prime()
 
@@ -184,9 +199,8 @@ class PersistentShell:
             except OSError:
                 pass
 
-        # Use our custom .bashrc
+        # Use custom .bashrc
         rc_file = HERE / ".bashrc"
-        
         cmd = ["/bin/bash", "--noediting", "-i"]
         if rc_file.exists():
             cmd.extend(["--rcfile", str(rc_file)])
@@ -202,7 +216,9 @@ class PersistentShell:
         loop = asyncio.get_event_loop()
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
-        await loop.connect_read_pipe(lambda: protocol, _PipeEndpoint(master))
+        
+        # CRITICAL: Store the transport to prevent it from being garbage collected
+        self.transport, _ = await loop.connect_read_pipe(lambda: protocol, _PipeEndpoint(master))
         self.reader = reader
 
     async def _prime(self):
@@ -210,7 +226,6 @@ class PersistentShell:
         event = asyncio.Event()
         self.current = {"id": "__prime__", "marker": marker, "event": event, "capture": []}
         
-        # Inject the cd command before printing the marker
         if IS_WINDOWS:
             cd_cmd = f"cd /d \\project\\fyp26_lz1\\{self.username}\n"
             payload = f"{cd_cmd}echo {marker}\r\n"
@@ -234,6 +249,9 @@ class PersistentShell:
         while view:
             try:
                 n = os.write(self.master_fd, view)
+                if n == 0:
+                    await asyncio.sleep(0.005)
+                    continue
                 view = view[n:]
             except BlockingIOError:
                 await asyncio.sleep(0.005)
@@ -273,9 +291,11 @@ class PersistentShell:
             while True:
                 try:
                     chunk = await self.reader.read(4096)
-                except Exception:
+                except Exception as e:
+                    log(f"pump read error: {e}")
                     break
                 if not chunk:
+                    log("pump read EOF (shell closed)")
                     break
                 buf += chunk.decode("utf-8", errors="replace")
                 if self.current is None:
@@ -356,7 +376,19 @@ class PersistentShell:
                 self.proc = None
                 self.current = None
                 return
-            await event.wait()
+            
+            # 2-hour timeout for very long commands (like model downloads)
+            try:
+                await asyncio.wait_for(event.wait(), timeout=7200)
+            except asyncio.TimeoutError:
+                await self._send({
+                    "type": "output", "id": cmd_id,
+                    "stream": "stderr", "data": "\n[terminal] command timed out after 2 hours\n",
+                })
+                await self._send({"type": "exit", "id": cmd_id, "code": -1})
+                self.current = None
+                await self.stop()
+                self.proc = None
 
     async def capture(self, cmd):
         async with self.lock:
@@ -418,10 +450,16 @@ class PersistentShell:
                     except subprocess.TimeoutExpired:
                         try: self.proc.kill()
                         except Exception: pass
+                        
+        if self.transport:
+            self.transport.close()
+            self.transport = None
+            
         if self.master_fd is not None:
             try: os.close(self.master_fd)
             except OSError: pass
             self.master_fd = None
+            
         if self.pump_task:
             self.pump_task.cancel()
             try:
