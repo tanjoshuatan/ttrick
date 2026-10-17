@@ -40,8 +40,17 @@ def log(msg: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="client.py")
-    p.add_argument("host_file", nargs="?", default=str(DEFAULT_HOST_FILE))
-    p.add_argument("-u", "--username", required=True)
+    p.add_argument(
+        "host_file",
+        nargs="?",
+        default=str(DEFAULT_HOST_FILE),
+        help=f"file containing the KV store base URL (default: {DEFAULT_HOST_FILE})",
+    )
+    p.add_argument(
+        "-u", "--username",
+        required=True,
+        help="username to look up in the KV store",
+    )
     return p.parse_args()
 
 
@@ -98,6 +107,8 @@ if not IS_WINDOWS:
 # ---------------------------------------------------------------- shell
 
 class PersistentShell:
+    """One bash per session (sid), persistent, with pty so Ctrl+C works."""
+
     def __init__(self, ws, send_lock, sid, username):
         self.ws = ws
         self.send_lock = send_lock
@@ -127,11 +138,12 @@ class PersistentShell:
         return self.proc.poll() is not None
 
     async def start(self):
-        log(f"[{self.sid[:8]}] start() called")
         if self.pump_task:
             self.pump_task.cancel()
-            try: await self.pump_task
-            except (asyncio.CancelledError, Exception): pass
+            try:
+                await self.pump_task
+            except (asyncio.CancelledError, Exception):
+                pass
             self.pump_task = None
             
         if self.transport:
@@ -143,18 +155,13 @@ class PersistentShell:
         else:
             await self._start_posix()
             
-        log(f"[{self.sid[:8]}] starting _pump task")
         self.pump_task = asyncio.create_task(self._pump())
         
-        log(f"[{self.sid[:8]}] calling _prime()")
+        # 5-second timeout to prevent NFS hangs from freezing the UI
         try:
             await asyncio.wait_for(self._prime(), timeout=5.0)
-            log(f"[{self.sid[:8]}] _prime() finished successfully")
         except asyncio.TimeoutError:
-            log(f"[{self.sid[:8]}] !!! _prime() TIMED OUT after 5 seconds !!!")
-            self.current = None
-        except Exception as e:
-            log(f"[{self.sid[:8]}] !!! _prime() CRASHED: {e} !!!")
+            log(f"Shell startup timed out for {self.sid[:8]}")
             self.current = None
 
     async def _start_windows(self):
@@ -167,60 +174,61 @@ class PersistentShell:
         self.reader = self.proc.stdout
 
     async def _start_posix(self):
-        log(f"[{self.sid[:8]}] opening pty")
         master, slave = pty.openpty()
         
+        # Set master to non-blocking so os.write never freezes the event loop
         flags = fcntl.fcntl(master, fcntl.F_GETFL)
         fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         
         try:
             attrs = termios.tcgetattr(slave)
-            attrs[3] &= ~(termios.ECHO | termios.ECHONL)
-            attrs[3] |= termios.NOFLSH
-            attrs[1] &= ~termios.ONLCR
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL)   # lflag: no echo
+            attrs[3] |= termios.NOFLSH                     # lflag: don't flush input on SIGINT
+            attrs[1] &= ~termios.ONLCR                     # oflag: no \n → \r\n
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         except Exception as e:
-            log(f"[{self.sid[:8]}] termios warning: {e}")
+            log(f"pty termios warning: {e}")
 
         env = os.environ.copy()
         env["TERM"] = "xterm"
-        env["PS1"] = ""
+        env["PS1"] = "$ "
         env["PS2"] = ""
         env["PROMPT_COMMAND"] = ""
         env["PYTHONUNBUFFERED"] = "1"
+        
         env["USER"] = self.username
         env["LOGNAME"] = self.username
         env["USERNAME"] = self.username
         env["HOME"] = f"/project/fyp26_lz1/{self.username}"
 
-        # CRITICAL FIX: Create HOME asynchronously so it doesn't freeze the loop
+        # Create HOME asynchronously so it doesn't freeze the loop
         try:
             await asyncio.to_thread(os.makedirs, env["HOME"], exist_ok=True)
         except Exception as e:
-            log(f"[{self.sid[:8]}] Failed to create HOME: {e}")
+            log(f"Failed to create HOME: {e}")
 
         def _child_setup():
             os.setsid()
-            try: fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-            except OSError: pass
+            try:
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            except OSError:
+                pass
 
         rc_file = HERE / ".bashrc"
+        
+        # --rcfile MUST come before -i
         cmd = ["/bin/bash", "--noediting"]
         if rc_file.exists():
             cmd.extend(["--rcfile", str(rc_file)])
         cmd.append("-i")
-            
-        log(f"[{self.sid[:8]}] calling Popen: {cmd}")
-        
-        # CRITICAL FIX: stderr=slave so bash errors print directly to the UI
+
+        # stderr=slave so bash errors print directly to the UI
         self.proc = subprocess.Popen(
             cmd,
             stdin=slave, stdout=slave, stderr=slave,
             env=env, preexec_fn=_child_setup, close_fds=True,
         )
-        log(f"[{self.sid[:8]}] Popen returned, PID: {self.proc.pid}")
-        
         os.close(slave)
         self.master_fd = os.dup(master)
 
@@ -229,12 +237,11 @@ class PersistentShell:
         protocol = asyncio.StreamReaderProtocol(reader)
         self.transport, _ = await loop.connect_read_pipe(lambda: protocol, _PipeEndpoint(master))
         self.reader = reader
-        log(f"[{self.sid[:8]}] _start_posix complete")
 
     async def _prime(self):
         marker = f"__RELAY_PRIME_{uuid.uuid4().hex}__"
         event = asyncio.Event()
-        # REMOVED capture: [] so it prints to the UI
+        # Removed capture so startup errors print to the UI
         self.current = {"id": "__prime__", "marker": marker, "event": event}
         
         if IS_WINDOWS:
@@ -279,20 +286,16 @@ class PersistentShell:
             })
 
     async def _pump(self):
-        log(f"[{self.sid[:8]}] _pump task started")
         assert self.reader is not None
         buf = ""
         try:
             while True:
                 try:
                     chunk = await self.reader.read(4096)
-                except Exception as e:
-                    log(f"[{self.sid[:8]}] pump read error: {e}")
+                except Exception:
                     break
                 if not chunk:
-                    log(f"[{self.sid[:8]}] pump read EOF")
                     break
-                
                 buf += chunk.decode("utf-8", errors="replace")
                 if self.current is None:
                     buf = ""
@@ -332,8 +335,6 @@ class PersistentShell:
                     cur["event"].set()
                     buf = rest[nl + 1:]
         finally:
-            rc = self.proc.poll() if self.proc else "unknown"
-            log(f"[{self.sid[:8]}] _pump task exiting. Bash return code: {rc}")
             cur = self.current
             if cur is not None and not cur["event"].is_set():
                 cur["event"].set()
@@ -354,7 +355,7 @@ class PersistentShell:
             if self._proc_dead():
                 await self.start()
                 if self._proc_dead():
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(1.0) # Prevent infinite tight loop
                     if self._proc_dead():
                         await self._send({
                             "type": "output", "id": cmd_id,
@@ -368,7 +369,6 @@ class PersistentShell:
             self.current = {"id": cmd_id, "marker": marker, "event": event}
             
             try:
-                log(f"[{self.sid[:8]}] run writing cmd: {cmd}")
                 await self._write(self._build_payload(cmd, marker).encode("utf-8"))
             except (BrokenPipeError, ConnectionResetError, OSError):
                 await self._send({
@@ -380,10 +380,14 @@ class PersistentShell:
                 self.current = None
                 return
             
+            # 2-hour timeout for very long commands (like model downloads)
             try:
                 await asyncio.wait_for(event.wait(), timeout=7200)
             except asyncio.TimeoutError:
-                await self._send({"type": "output", "id": cmd_id, "stream": "stderr", "data": "\n[terminal] timed out after 2 hours\n"})
+                await self._send({
+                    "type": "output", "id": cmd_id,
+                    "stream": "stderr", "data": "\n[terminal] command timed out after 2 hours\n",
+                })
                 await self._send({"type": "exit", "id": cmd_id, "code": -1})
                 self.current = None
                 await self.stop()
@@ -419,8 +423,10 @@ class PersistentShell:
             return
         if IS_WINDOWS:
             if self.proc and self.proc.returncode is None:
-                try: self.proc.terminate()
-                except Exception: pass
+                try:
+                    self.proc.terminate()
+                except Exception:
+                    pass
             return
         if self.master_fd is None:
             return
