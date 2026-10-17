@@ -38,7 +38,3 @@ export NPM_CONFIG_CACHE="$BASE_DIR/.npm"
 
 # 9. Temporary files
 export TMPDIR="$BASE_DIR/.cache/tmp"
-
-# 10. Quality of life
-alias ll="ls -la"
-alias gs="git status"
