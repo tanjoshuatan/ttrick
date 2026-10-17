@@ -199,12 +199,6 @@ class PersistentShell:
         env["USERNAME"] = self.username
         env["HOME"] = f"/project/fyp26_lz1/{self.username}"
 
-        # CRITICAL: Create the HOME folder right now so bash doesn't crash
-        try:
-            os.makedirs(env["HOME"], exist_ok=True)
-        except OSError as e:
-            log(f"FAILED to create HOME: {e}")
-
         def _child_setup():
             os.setsid()
             try:
@@ -248,12 +242,11 @@ class PersistentShell:
         event = asyncio.Event()
         self.current = {"id": "__prime__", "marker": marker, "event": event, "capture": []}
         
+        # Just echo the marker. No `cd` command.
         if IS_WINDOWS:
-            cd_cmd = f"cd /d \\project\\fyp26_lz1\\{self.username}\n"
-            payload = f"{cd_cmd}echo {marker}\r\n"
+            payload = f"echo {marker}\r\n"
         else:
-            cd_cmd = f"cd /project/fyp26_lz1/{self.username}\n"
-            payload = f"{cd_cmd}printf '{marker}\\n'\n"
+            payload = f"printf '{marker}\\n'\n"
             
         await self._write(payload.encode())
         await event.wait()
