@@ -188,9 +188,17 @@ class PersistentShell:
         env["PROMPT_COMMAND"] = ""
         env["PYTHONUNBUFFERED"] = "1"
         
-        # Inject username and ensure HOME points to the user's specific folder
+        # Inject the user variables
+        env["USER"] = self.username
+        env["LOGNAME"] = self.username
         env["USERNAME"] = self.username
         env["HOME"] = f"/project/fyp26_lz1/{self.username}"
+
+        # CRITICAL: Create $HOME if it doesn't exist, so `bash -i` doesn't crash
+        try:
+            os.makedirs(env["HOME"], exist_ok=True)
+        except OSError as e:
+            log(f"Failed to create HOME directory: {e}")
 
         def _child_setup():
             os.setsid()
