@@ -7,6 +7,10 @@
 BASE_DIR="/project/fyp26_lz1"
 USER_DIR="$BASE_DIR/$USERNAME"
 
+# Fix the ugly prompt (bypasses missing /etc/passwd user)
+# \w = current working directory, \$ = # for root, $ for normal user
+export PS1=""
+
 # 2. Set UMASK so group members can read/write each other's files
 umask 002
 
