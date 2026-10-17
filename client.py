@@ -241,13 +241,15 @@ class PersistentShell:
     async def _prime(self):
         marker = f"__RELAY_PRIME_{uuid.uuid4().hex}__"
         event = asyncio.Event()
-        # Removed capture so startup errors print to the UI
         self.current = {"id": "__prime__", "marker": marker, "event": event}
         
         if IS_WINDOWS:
-            payload = f"echo {marker}\r\n"
+            cd_cmd = f"cd /d \\project\\fyp26_lz1\\{self.username}\n"
+            payload = f"{cd_cmd}echo {marker}\r\n"
         else:
-            payload = f"printf '{marker}\\n'\n"
+            # 2>/dev/null || true prevents errors if the dir doesn't exist
+            cd_cmd = f"cd /project/fyp26_lz1/{self.username} 2>/dev/null || true\n"
+            payload = f"{cd_cmd}printf '{marker}\\n'\n"
             
         await self._write(payload.encode())
         await event.wait()
