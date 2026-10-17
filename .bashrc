@@ -7,14 +7,6 @@
 BASE_DIR="/project/fyp26_lz1"
 USER_DIR="$BASE_DIR/${USERNAME:-$(whoami)}"
 
-# 2. Ensure the user's personal folder and all shared cache dirs exist
-mkdir -p "$USER_DIR"
-mkdir -p "$BASE_DIR/.cache/tmp"
-mkdir -p "$BASE_DIR/.hf_cache/hub"
-mkdir -p "$BASE_DIR/.hf_cache/xet"
-mkdir -p "$BASE_DIR/.vllm"
-mkdir -p "$BASE_DIR/.vllm-config"
-
 # 3. Set UMASK so group members (31890) can read/write each other's files
 umask 002
 
