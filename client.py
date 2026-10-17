@@ -40,17 +40,8 @@ def log(msg: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="client.py")
-    p.add_argument(
-        "host_file",
-        nargs="?",
-        default=str(DEFAULT_HOST_FILE),
-        help=f"file containing the KV store base URL (default: {DEFAULT_HOST_FILE})",
-    )
-    p.add_argument(
-        "-u", "--username",
-        required=True,
-        help="username to look up in the KV store",
-    )
+    p.add_argument("host_file", nargs="?", default=str(DEFAULT_HOST_FILE))
+    p.add_argument("-u", "--username", required=True)
     return p.parse_args()
 
 
@@ -107,8 +98,6 @@ if not IS_WINDOWS:
 # ---------------------------------------------------------------- shell
 
 class PersistentShell:
-    """One bash per session (sid), persistent, with pty so Ctrl+C works."""
-
     def __init__(self, ws, send_lock, sid, username):
         self.ws = ws
         self.send_lock = send_lock
@@ -117,7 +106,7 @@ class PersistentShell:
         self.proc = None
         self.master_fd = None
         self.reader = None
-        self.transport = None  # <-- Keep reference to prevent GC
+        self.transport = None
         self.pump_task = None
         self.stderr_task = None
         self.lock = asyncio.Lock()
@@ -139,13 +128,11 @@ class PersistentShell:
         return self.proc.poll() is not None
 
     async def start(self):
-        # Clean up any previous transport/tasks
+        log(f"[{self.sid[:8]}] start() called")
         if self.pump_task:
             self.pump_task.cancel()
-            try:
-                await self.pump_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            try: await self.pump_task
+            except (asyncio.CancelledError, Exception): pass
             self.pump_task = None
             
         if self.transport:
@@ -157,10 +144,22 @@ class PersistentShell:
         else:
             await self._start_posix()
             
+        log(f"[{self.sid[:8]}] starting _pump task")
         self.pump_task = asyncio.create_task(self._pump())
-        await self._prime()
+        
+        log(f"[{self.sid[:8]}] calling _prime()")
+        try:
+            await asyncio.wait_for(self._prime(), timeout=5.0)
+            log(f"[{self.sid[:8]}] _prime() finished successfully")
+        except asyncio.TimeoutError:
+            log(f"[{self.sid[:8]}] !!! _prime() TIMED OUT after 5 seconds !!!")
+            self.current = None
+        except Exception as e:
+            log(f"[{self.sid[:8]}] !!! _prime() CRASHED: {e} !!!")
+            self.current = None
 
     async def _start_windows(self):
+        log(f"[{self.sid[:8]}] starting cmd.exe")
         self.proc = await asyncio.create_subprocess_exec(
             "cmd.exe", "/Q", "/V:ON",
             stdin=asyncio.subprocess.PIPE,
@@ -170,9 +169,9 @@ class PersistentShell:
         self.reader = self.proc.stdout
 
     async def _start_posix(self):
+        log(f"[{self.sid[:8]}] opening pty")
         master, slave = pty.openpty()
         
-        # Set master to non-blocking
         flags = fcntl.fcntl(master, fcntl.F_GETFL)
         fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         
@@ -184,16 +183,14 @@ class PersistentShell:
             termios.tcsetattr(slave, termios.TCSANOW, attrs)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         except Exception as e:
-            log(f"pty termios warning: {e}")
+            log(f"[{self.sid[:8]}] termios warning: {e}")
 
         env = os.environ.copy()
-        env["TERM"] = "xterm"  # Changed from "dumb" just in case
+        env["TERM"] = "xterm"
         env["PS1"] = ""
         env["PS2"] = ""
         env["PROMPT_COMMAND"] = ""
         env["PYTHONUNBUFFERED"] = "1"
-        
-        # Explicitly set user variables
         env["USER"] = self.username
         env["LOGNAME"] = self.username
         env["USERNAME"] = self.username
@@ -201,24 +198,25 @@ class PersistentShell:
 
         def _child_setup():
             os.setsid()
-            try:
-                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-            except OSError:
-                pass
+            try: fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            except OSError: pass
 
         rc_file = HERE / ".bashrc"
-        cmd = ["/bin/bash", "--noediting", "--rcfile", str(rc_file), "-i"]
-
-        # CRITICAL: Capture stderr so we can see bash's crash message!
+        cmd = ["/bin/bash", "--noediting", "-i"]
+        if rc_file.exists():
+            cmd.extend(["--rcfile", str(rc_file)])
+            
+        log(f"[{self.sid[:8]}] calling Popen: {cmd}")
         self.proc = subprocess.Popen(
             cmd,
             stdin=slave, stdout=slave, stderr=subprocess.PIPE,
             env=env, preexec_fn=_child_setup, close_fds=True,
         )
+        log(f"[{self.sid[:8]}] Popen returned, PID: {self.proc.pid}")
+        
         os.close(slave)
         self.master_fd = os.dup(master)
 
-        # Background task to read bash's errors
         async def read_stderr():
             while True:
                 try:
@@ -227,29 +225,33 @@ class PersistentShell:
                     break
                 if not chunk:
                     break
-                log(f"BASH CRASH: {chunk.decode('utf-8', errors='replace').strip()}")
+                log(f"[{self.sid[:8]}] BASH STDERR: {chunk.decode('utf-8', errors='replace').strip()}")
 
-        asyncio.create_task(read_stderr())
+        self.stderr_task = asyncio.create_task(read_stderr())
 
+        log(f"[{self.sid[:8]}] calling connect_read_pipe")
         loop = asyncio.get_event_loop()
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
         self.transport, _ = await loop.connect_read_pipe(lambda: protocol, _PipeEndpoint(master))
         self.reader = reader
+        log(f"[{self.sid[:8]}] _start_posix complete")
 
     async def _prime(self):
         marker = f"__RELAY_PRIME_{uuid.uuid4().hex}__"
         event = asyncio.Event()
         self.current = {"id": "__prime__", "marker": marker, "event": event, "capture": []}
         
-        # Just echo the marker. No `cd` command.
         if IS_WINDOWS:
             payload = f"echo {marker}\r\n"
         else:
             payload = f"printf '{marker}\\n'\n"
             
+        log(f"[{self.sid[:8]}] _prime writing payload: {repr(payload)}")
         await self._write(payload.encode())
+        log(f"[{self.sid[:8]}] _prime waiting for event...")
         await event.wait()
+        log(f"[{self.sid[:8]}] _prime event received!")
 
     async def _write(self, data):
         if IS_WINDOWS:
@@ -284,22 +286,8 @@ class PersistentShell:
                 "type": "output", "id": cur["id"], "stream": stream, "data": data,
             })
 
-    async def _stderr_pump(self):
-        if not (self.proc and getattr(self.proc, "stderr", None)):
-            return
-        while True:
-            try:
-                chunk = await self.proc.stderr.read(4096)
-            except Exception:
-                return
-            if not chunk:
-                return
-            if self.current:
-                await self._emit(chunk.decode("utf-8", errors="replace"), "stderr")
-
     async def _pump(self):
-        if IS_WINDOWS:
-            self.stderr_task = asyncio.create_task(self._stderr_pump())
+        log(f"[{self.sid[:8]}] _pump task started")
         assert self.reader is not None
         buf = ""
         try:
@@ -307,12 +295,15 @@ class PersistentShell:
                 try:
                     chunk = await self.reader.read(4096)
                 except Exception as e:
-                    log(f"pump read error: {e}")
+                    log(f"[{self.sid[:8]}] pump read error: {e}")
                     break
                 if not chunk:
-                    log("pump read EOF (shell closed)")
+                    log(f"[{self.sid[:8]}] pump read EOF (shell closed)")
                     break
+                
+                log(f"[{self.sid[:8]}] pump raw read: {repr(chunk)}")
                 buf += chunk.decode("utf-8", errors="replace")
+                
                 if self.current is None:
                     buf = ""
                     continue
@@ -348,9 +339,11 @@ class PersistentShell:
                     cur["code"] = code
                     if cur.get("capture") is None:
                         await self._send({"type": "exit", "id": cur["id"], "code": code})
+                    log(f"[{self.sid[:8]}] pump found marker, code: {code}")
                     cur["event"].set()
                     buf = rest[nl + 1:]
         finally:
+            log(f"[{self.sid[:8]}] _pump task exiting")
             if self.stderr_task:
                 self.stderr_task.cancel()
                 try:
@@ -381,6 +374,7 @@ class PersistentShell:
             event = asyncio.Event()
             self.current = {"id": cmd_id, "marker": marker, "event": event}
             try:
+                log(f"[{self.sid[:8]}] run writing cmd: {cmd}")
                 await self._write(self._build_payload(cmd, marker).encode("utf-8"))
             except (BrokenPipeError, ConnectionResetError, OSError):
                 await self._send({
@@ -392,14 +386,10 @@ class PersistentShell:
                 self.current = None
                 return
             
-            # 2-hour timeout for very long commands (like model downloads)
             try:
                 await asyncio.wait_for(event.wait(), timeout=7200)
             except asyncio.TimeoutError:
-                await self._send({
-                    "type": "output", "id": cmd_id,
-                    "stream": "stderr", "data": "\n[terminal] command timed out after 2 hours\n",
-                })
+                await self._send({"type": "output", "id": cmd_id, "stream": "stderr", "data": "\n[terminal] timed out after 2 hours\n"})
                 await self._send({"type": "exit", "id": cmd_id, "code": -1})
                 self.current = None
                 await self.stop()
@@ -435,10 +425,8 @@ class PersistentShell:
             return
         if IS_WINDOWS:
             if self.proc and self.proc.returncode is None:
-                try:
-                    self.proc.terminate()
-                except Exception:
-                    pass
+                try: self.proc.terminate()
+                except Exception: pass
             return
         if self.master_fd is None:
             return
